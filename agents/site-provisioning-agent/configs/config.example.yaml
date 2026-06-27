@@ -1,0 +1,103 @@
+# Mavora Site Provisioning Agent — example configuration
+# Copy to /etc/mavora-agent/config.yaml and fill in real values.
+# File permissions: chmod 0600 /etc/mavora-agent/config.yaml
+# Owner: mavora-agent (set by installer)
+#
+# SECURITY: This file must be 0600 owned by mavora-agent.
+# The agent refuses to start if permissions are unsafe (AGENT_SECRET_PERMISSION_UNSAFE).
+# Secret values are NEVER stored here — only file paths to secret files.
+# Secret files (cert, key, bearer, ed25519 pub) must also be 0600.
+#
+# Model C: NO SSL/certbot/AOP/Cloudflare/registrar/DNS-provider configuration.
+# The agent serves HTTP port 80 only. SSL and DNS are Customer-managed.
+# NO inbound port is opened by this agent (outbound HTTPS 443 only).
+
+# control_plane: Base URL of the Mavora API (HTTPS, port 443).
+# The agent only connects outbound to this address.
+control_plane: "https://REPLACE_WITH_MAVORA_CONTROL_PLANE_URL"
+
+# agent_id: UUID of this agent record in Mavora (created by super_admin).
+# Injected by the installer from the bootstrap response.
+agent_id: "REPLACE_WITH_AGENT_UUID"
+
+# ── Secret file paths (must be 0600, owner mavora-agent) ───────────────────
+# Values are NEVER read from environment — only file path overrides are allowed.
+
+# tls_cert_path: Path to the mTLS client certificate (signed by Mavora internal CA).
+# Generated on this VPS during install; the private key never leaves this host.
+tls_cert_path: "/etc/mavora-agent/client.crt"
+
+# tls_key_path: Path to the mTLS private key (generated on-VPS, NEVER transmitted).
+tls_key_path: "/etc/mavora-agent/client.key"
+
+# ca_cert_path: Path to the Mavora internal CA certificate bundle.
+# Used to pin the control-plane TLS certificate (no TOFU, no skip-verify).
+# Mode: 0644 (not a secret).
+ca_cert_path: "/etc/mavora-agent/ca.crt"
+
+# bearer_path: Path to the runtime bearer token file (connection_key).
+# Received from the control plane during install; stored 0600.
+# Loaded into memory at startup; NEVER logged.
+bearer_path: "/etc/mavora-agent/bearer.token"
+
+# ed25519_public_key_path: Path to Mavora's Ed25519 signing PUBLIC key.
+# The agent uses this to VERIFY signed job envelopes.
+# The signing PRIVATE key stays on Mavora — the agent cannot forge jobs.
+ed25519_public_key_path: "/etc/mavora-agent/signing.pub"
+
+# signing_key_ids: List of accepted key IDs for Ed25519 verification.
+# During rotation grace window, both old and new key IDs are listed here.
+# Updated by rotate.sh automatically.
+signing_key_ids:
+  - "REPLACE_WITH_SIGNING_KEY_ID"
+  # During rotation grace (15 min default), add new key ID here:
+  # - "REPLACE_WITH_NEW_SIGNING_KEY_ID"
+
+# ── VPS paths ───────────────────────────────────────────────────────────────
+
+# webroot: WordPress Multisite web root directory.
+# Must be in ReadWritePaths (systemd unit) for WP-CLI write access.
+webroot: "/var/www"
+
+# nginx_sites_available: nginx sites-available directory.
+nginx_sites_available: "/etc/nginx/sites-available"
+
+# nginx_sites_enabled: nginx sites-enabled directory (symlinks).
+nginx_sites_enabled: "/etc/nginx/sites-enabled"
+
+# state_dir_path: Writable directory for the local idempotency store.
+# Must be in ReadWritePaths. Created by installer.
+state_dir_path: "/var/lib/mavora-agent"
+
+# ── Timing ──────────────────────────────────────────────────────────────────
+
+# heartbeat_interval_sec: Heartbeat POST interval in seconds.
+# MUST be ≤30 (spec RC-3 / §14.4). Default: 30.
+heartbeat_interval_sec: 30
+
+# poll_timeout_sec: Long-poll HTTP client timeout (must be >30 to exceed server hold ~30s).
+# Default: 35.
+poll_timeout_sec: 35
+
+# ── Resource admission thresholds (RC-5 / SP-ADR-012) ──────────────────────
+# These are read by the heartbeat and compared server-side for admission control.
+# If exceeded, Mavora rejects step-2 with AGENT_RESOURCE_EXHAUSTED.
+# Defaults match spec thresholds. Override only if you have non-standard hardware.
+#
+# resource_thresholds:
+#   disk_percent_max: 85      # % of webroot partition used before rejection
+#   ram_percent_max: 90       # % of RAM used before rejection
+#   load5_factor_max: 1.5     # load5 > cores * factor → rejection
+
+# ── Optional features ────────────────────────────────────────────────────────
+
+# firewall_enabled: Enable optional IP-allowlist for inbound port 80 (SP-BR-17).
+# Default OFF. Only enable on Mavora-provided VPS when Customer uses known proxy.
+# Provisioning does NOT fail if firewall_enabled=false or if firewall fails.
+# NO Cloudflare or managed-DNS CIDR ranges — only Customer's known proxy IPs.
+firewall_enabled: false
+
+# firewall_proxy_cidrs: Proxy CIDR ranges to allowlist on port 80.
+# Only used when firewall_enabled=true.
+# firewall_proxy_cidrs:
+#   - "REPLACE_WITH_CUSTOMER_PROXY_CIDR"

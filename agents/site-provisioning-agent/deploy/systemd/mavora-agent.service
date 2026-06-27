@@ -1,0 +1,108 @@
+# mavora-agent.service — systemd unit for the Mavora Site Provisioning Agent
+# SP-T-216 / agent/05 §37
+#
+# Hardening notes:
+#   ProtectSystem=strict  → whole FS read-only except ReadWritePaths
+#   ReadWritePaths        → webroot + nginx dirs + state dir (MUST include webroot
+#                           so WP-CLI run via sudo www-data can write uploads/cache)
+#   CapabilityBoundingSet= → empty: drop ALL capabilities; sudo provides allowlist
+#   NoNewPrivileges=yes   → no suid/capability escalation (sudo policy still works
+#                           because NoNewPrivileges blocks setuid escalation, not
+#                           already-configured sudo policy entries)
+#   ProtectHome=yes       → no access to /home or /root
+#   PrivateTmp=yes        → isolated /tmp per service
+#   ProtectKernelTunables=yes → cannot write /proc/sys or sysctl
+#   ProtectKernelModules=yes  → cannot load kernel modules
+#   ProtectControlGroups=yes  → cannot modify cgroup hierarchy
+#   RestrictSUIDSGID=yes  → cannot set SUID/SGID bits
+#   LockPersonality=yes   → cannot change execution domain
+#   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX → minimal socket families
+#   SystemCallFilter=@system-service → restrict to service-appropriate syscalls
+#
+# MemoryDenyWriteExecute intentionally OMITTED:
+#   WP-CLI is invoked indirectly via wp-safe helper which runs PHP under www-data.
+#   Some PHP/OPcache-JIT configurations require W+X memory pages. MDWE would cause
+#   WP-CLI to crash silently on affected PHP versions. If the fleet PHP CLI has JIT
+#   disabled (opcache.jit=0), MDWE=yes can be re-added for stronger hardening.
+#   See agent/05 §37.4 for details.
+#
+# IMPORTANT: ReadWritePaths values are injected by install.sh at install time.
+#   The PLACEHOLDER_ tokens below are replaced during installation.
+#   Do not edit this service file manually on the VPS — re-run the installer.
+#
+# NO inbound port is opened by this service. The agent is outbound-443 only.
+# Port 80 is served by nginx (a separate service), not by this unit.
+
+[Unit]
+Description=Mavora Site Provisioning Agent
+Documentation=https://docs.mavora.io/agent
+After=network-online.target
+Wants=network-online.target
+# Do not start if networking is unavailable — agent is outbound-only
+ConditionPathExists=/etc/mavora-agent/config.yaml
+
+[Service]
+Type=simple
+User=mavora-agent
+Group=mavora-agent
+
+ExecStart=PLACEHOLDER_BINARY_PATH
+
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=5
+
+# ── Hardening ──────────────────────────────────────────────────────────────
+# Drop all capabilities; allowlisted sudo commands handle privileged ops.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# No new privilege escalation via suid/sgid (sudo policy still works).
+NoNewPrivileges=yes
+
+# Whole filesystem read-only except ReadWritePaths.
+ProtectSystem=strict
+
+# No access to /home, /root, or /run/user.
+ProtectHome=yes
+
+# Private /tmp — isolated from other services.
+PrivateTmp=yes
+
+# Cannot write to /proc/sys (kernel tunables).
+ProtectKernelTunables=yes
+
+# Cannot load/unload kernel modules.
+ProtectKernelModules=yes
+
+# Cannot modify cgroup hierarchy.
+ProtectControlGroups=yes
+
+# Cannot set SUID/SGID bits on files.
+RestrictSUIDSGID=yes
+
+# Cannot change execution domain (setdomainname, etc).
+LockPersonality=yes
+
+# Minimal address families: IPv4, IPv6, Unix sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Restrict to syscalls typical for a daemon service.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# MemoryDenyWriteExecute intentionally absent — see header comment above.
+
+# ── ReadWritePaths ─────────────────────────────────────────────────────────
+# MUST include:
+#   - state_dir:        idempotency store (JSON + flock)
+#   - log_dir:          structured log output
+#   - nginx sites dirs: write-vhost helper writes here (via sudo)
+#   - webroot:          WP-CLI (as www-data via sudo) writes uploads/cache
+#
+# These are PLACEHOLDER_ tokens replaced by install.sh with actual paths.
+ReadWritePaths=PLACEHOLDER_WEBROOT PLACEHOLDER_NGINX_SITES_AVAILABLE PLACEHOLDER_NGINX_SITES_ENABLED PLACEHOLDER_STATE_DIR /var/log/mavora-agent
+
+[Install]
+WantedBy=multi-user.target

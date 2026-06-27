@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+#
+# mavora-agents — single entry point to list / inspect / install / run the
+# pre-built Mavora agent binaries shipped in this repository.
+#
+# This repo is meant to be cloned onto a Client VPS; this dispatcher auto-detects
+# the OS/arch, picks the matching binary, and drives the agent's own installer.
+#
+#   ./mavora-agents list
+#   ./mavora-agents info    <agent>
+#   ./mavora-agents verify  [<agent>]
+#   ./mavora-agents run     <agent> [-- <agent-args>]      # run the binary directly (e.g. --version)
+#   sudo ./mavora-agents install <agent> -- <install-args> # install as a hardened systemd service
+#
+# Example — install the site-provisioning agent on this VPS:
+#   sudo ./mavora-agents install site-provisioning-agent -- \
+#        --token-file /root/install-token --control-plane https://api.mavoraos.com
+#
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
+AGENTS_DIR="${REPO_DIR}/agents"
+
+# ── platform detection ────────────────────────────────────────────────────────
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   echo "amd64" ;;
+    aarch64|arm64)  echo "arm64" ;;
+    *)              echo "UNSUPPORTED:$(uname -m)" ;;
+  esac
+}
+detect_os() { uname -s | tr '[:upper:]' '[:lower:]'; }
+
+# Portable sha256 verify (Linux: sha256sum, macOS: shasum -a 256).
+_sha256_check() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum -c "$1";
+  else shasum -a 256 -c "$1"; fi
+}
+
+# resolve_bin <agent> → prints the absolute binary path for this OS/arch (or fails).
+resolve_bin() {
+  local agent="$1" os arch bin
+  os="$(detect_os)"; arch="$(detect_arch)"
+  [ -d "${AGENTS_DIR}/${agent}" ] || { echo "ERROR: unknown agent '${agent}' — run: ./mavora-agents list" >&2; return 1; }
+  case "$arch" in UNSUPPORTED:*) echo "ERROR: unsupported CPU arch '$(uname -m)'" >&2; return 1 ;; esac
+  bin="${AGENTS_DIR}/${agent}/bin/mavora-agent_${os}_${arch}"
+  [ -x "$bin" ] || { echo "ERROR: no ${os}/${arch} binary for '${agent}' (looked for ${bin})" >&2; return 1; }
+  echo "$bin"
+}
+
+list_agents() {
+  echo "Mavora agent binaries in this repo (host: $(detect_os)/$(detect_arch)):"
+  echo ""
+  local d name ver arches
+  for d in "${AGENTS_DIR}"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    ver="$(awk -F'[: ]+' '/^version:/{print $2}' "${d}BUILD_INFO" 2>/dev/null)"
+    arches="$(ls "${d}bin" 2>/dev/null | sed 's/.*_linux_/linux\//' | tr '\n' ' ')"
+    printf "  %-26s version=%-18s [%s]\n" "$name" "${ver:-?}" "${arches:-no binaries}"
+  done
+  echo ""
+  echo "Commands:  list | info <a> | verify [a] | run <a> [-- args] | install <a> -- args"
+  echo "Install :  sudo ./mavora-agents install site-provisioning-agent -- \\"
+  echo "             --token-file /root/install-token --control-plane https://api.mavoraos.com"
+}
+
+cmd="${1:-list}"; [ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+  list|"")
+    list_agents
+    ;;
+  info)
+    agent="${1:?usage: ./mavora-agents info <agent>}"
+    echo "=== ${agent} / BUILD_INFO ==="; cat "${AGENTS_DIR}/${agent}/BUILD_INFO"
+    echo "=== SHA256SUMS ==="; cat "${AGENTS_DIR}/${agent}/SHA256SUMS"
+    ;;
+  verify)
+    agent="${1:-}"
+    if [ -n "$agent" ]; then targets=("${AGENTS_DIR}/${agent}"); else targets=("${AGENTS_DIR}"/*); fi
+    rc=0
+    for d in "${targets[@]}"; do
+      [ -f "${d}/SHA256SUMS" ] || continue
+      echo "verify $(basename "$d"):"
+      ( cd "${d}/bin" && _sha256_check ../SHA256SUMS ) || rc=1
+    done
+    exit $rc
+    ;;
+  run)
+    agent="${1:?usage: ./mavora-agents run <agent> [-- args]}"; shift
+    [ "${1:-}" = "--" ] && shift || true
+    bin="$(resolve_bin "$agent")"
+    echo "→ exec ${bin} $*" >&2
+    exec "$bin" "$@"
+    ;;
+  install)
+    agent="${1:?usage: sudo ./mavora-agents install <agent> -- <install-args>}"; shift
+    [ "${1:-}" = "--" ] && shift || true
+    bin="$(resolve_bin "$agent")"
+    installer="${AGENTS_DIR}/${agent}/scripts/install.sh"
+    [ -f "$installer" ] || { echo "ERROR: no scripts/install.sh for '${agent}'" >&2; exit 1; }
+    if [ "$(id -u)" -ne 0 ]; then
+      echo "→ sudo bash ${installer} --binary ${bin} $*" >&2
+      exec sudo bash "$installer" --binary "$bin" "$@"
+    fi
+    echo "→ bash ${installer} --binary ${bin} $*" >&2
+    exec bash "$installer" --binary "$bin" "$@"
+    ;;
+  -h|--help|help)
+    list_agents
+    ;;
+  *)
+    echo "Unknown command: ${cmd}" >&2
+    list_agents
+    exit 1
+    ;;
+esac

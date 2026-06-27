@@ -1,0 +1,6 @@
+# Binaries ARE committed in this repo (it is a binary-distribution repo) —
+# do NOT ignore agents/*/bin. Only ignore local junk.
+.DS_Store
+*.tmp
+*.log
+*.swp

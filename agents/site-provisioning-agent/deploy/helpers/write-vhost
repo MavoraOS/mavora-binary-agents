@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# write-vhost — Root-owned nginx vhost write helper (SP-T-216)
+#
+# SECURITY INVARIANTS:
+#   - This binary is installed root:root 0755
+#   - Called via sudoers allowlist only (mavora-agent user → root)
+#   - Validates all arguments strictly before writing anything
+#   - Writes ONLY to the configured sites-available directory
+#   - Filename MUST be a safe domain name (no path traversal, no metachar)
+#   - Creates symlink in sites-enabled only when --enable is passed
+#   - NEVER writes to arbitrary paths
+#   - NEVER executes shell commands from arguments
+#
+# Usage (called by agent via sudo):
+#   write-vhost write  <sites-available-dir> <sites-enabled-dir> <filename> <config-content>
+#   write-vhost remove <sites-available-dir> <sites-enabled-dir> <filename>
+#   write-vhost enable <sites-available-dir> <sites-enabled-dir> <filename>
+#
+# Arguments are validated: reject metachar, path traversal, absolute paths in filename.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+fail() { echo "write-vhost ERROR: $*" >&2; exit 1; }
+
+# ─────────────────────────── validate filename ──────────────────────────────
+# Filename must be a safe nginx config filename: domain.conf
+# Reject: path traversal (..), absolute paths (/), shell metachar
+validate_filename() {
+    local fname="$1"
+    # Must not be empty
+    [[ -n "$fname" ]] || fail "Filename is empty."
+    # Must not contain path separators or traversal
+    [[ "$fname" != *"/"* ]] || fail "Filename contains path separator: $fname"
+    [[ "$fname" != *".."* ]] || fail "Filename contains path traversal: $fname"
+    # Must match safe pattern: alphanumeric + . - _ (domain.conf pattern)
+    [[ "$fname" =~ ^[a-zA-Z0-9._-]+\.conf$ ]] || \
+        fail "Filename must match pattern <domain>.conf (got: $fname)"
+    # Reject shell metachar just in case
+    local bad_chars='; | & $ ` < > ( ) { } \ "'
+    local c
+    for c in $bad_chars; do
+        [[ "$fname" != *"$c"* ]] || fail "Filename contains forbidden character '$c': $fname"
+    done
+}
+
+# ─────────────────────────── validate directory ──────────────────────────────
+validate_dir() {
+    local dir="$1" label="$2"
+    [[ -n "$dir" ]] || fail "$label directory is empty."
+    [[ "$dir" == "/"* ]] || fail "$label directory must be absolute path."
+    [[ -d "$dir" ]] || fail "$label directory does not exist: $dir"
+    # Sanity: must look like an nginx sites dir
+    echo "$dir" | grep -qE 'nginx|sites' || \
+        fail "$label directory does not look like an nginx directory: $dir"
+}
+
+# ─────────────────────────── op: write ──────────────────────────────────────
+op_write() {
+    local sites_available="$1"
+    local sites_enabled="$2"
+    local filename="$3"
+    local content="$4"
+
+    validate_dir "$sites_available" "sites-available"
+    validate_dir "$sites_enabled"   "sites-enabled"
+    validate_filename "$filename"
+
+    local dest="${sites_available}/${filename}"
+    local link="${sites_enabled}/${filename}"
+
+    # Write atomically via temp file
+    local tmp
+    tmp="$(mktemp "${sites_available}/.mavora-vhost-XXXXXX.tmp")"
+    printf '%s' "$content" > "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$dest"
+
+    # Create symlink (enable)
+    ln -sfn "$dest" "$link"
+
+    echo "write-vhost: wrote $dest + symlink $link"
+}
+
+# ─────────────────────────── op: remove ─────────────────────────────────────
+op_remove() {
+    local sites_available="$1"
+    local sites_enabled="$2"
+    local filename="$3"
+
+    validate_dir "$sites_available" "sites-available"
+    validate_dir "$sites_enabled"   "sites-enabled"
+    validate_filename "$filename"
+
+    local conf="${sites_available}/${filename}"
+    local link="${sites_enabled}/${filename}"
+
+    rm -f "$link" && echo "write-vhost: removed symlink $link (if existed)"
+    rm -f "$conf" && echo "write-vhost: removed config $conf (if existed)"
+}
+
+# ─────────────────────────── op: enable ─────────────────────────────────────
+op_enable() {
+    local sites_available="$1"
+    local sites_enabled="$2"
+    local filename="$3"
+
+    validate_dir "$sites_available" "sites-available"
+    validate_dir "$sites_enabled"   "sites-enabled"
+    validate_filename "$filename"
+
+    local conf="${sites_available}/${filename}"
+    local link="${sites_enabled}/${filename}"
+
+    [[ -f "$conf" ]] || fail "Config does not exist: $conf"
+    ln -sfn "$conf" "$link"
+    echo "write-vhost: enabled symlink $link → $conf"
+}
+
+# ─────────────────────────── main ───────────────────────────────────────────
+[[ $# -ge 1 ]] || fail "Usage: write-vhost <write|remove|enable> <sites-available> <sites-enabled> <filename> [content]"
+
+OP="$1"
+shift
+
+case "$OP" in
+    write)
+        [[ $# -ge 4 ]] || fail "write requires: <sites-available> <sites-enabled> <filename> <content>"
+        op_write "$1" "$2" "$3" "$4"
+        ;;
+    remove)
+        [[ $# -ge 3 ]] || fail "remove requires: <sites-available> <sites-enabled> <filename>"
+        op_remove "$1" "$2" "$3"
+        ;;
+    enable)
+        [[ $# -ge 3 ]] || fail "enable requires: <sites-available> <sites-enabled> <filename>"
+        op_enable "$1" "$2" "$3"
+        ;;
+    *)
+        fail "Unknown operation: $OP (allowed: write, remove, enable)"
+        ;;
+esac

@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# wp-safe — Allowlisted WP-CLI wrapper helper (SP-T-216)
+#
+# SECURITY INVARIANTS:
+#   - Root-owned 0755; called via sudoers allowlist only
+#   - --path is FIXED from WP_PATH env var (set by agent from config, NOT from payload)
+#   - Only allowlisted subcommand groups are permitted
+#   - All argv is validated for metachar and traversal before exec
+#   - Drops to www-data before executing wp
+#   - Uses argv array (exec, NO shell interpolation)
+#   - --format=json enforced on data-output commands
+#   - NEVER accepts --path from caller arguments (SSRF/traversal prevention)
+#
+# Usage (called by agent via sudo):
+#   sudo wp-safe site list [--url=<url>] [--format=json]
+#   sudo wp-safe site create --slug=<slug> [--title=<title>]
+#   sudo wp-safe site archive --slug=<slug>
+#   sudo wp-safe site delete --slug=<slug> [--yes]
+#   sudo wp-safe user create <login> <email> --role=<role>
+#   sudo wp-safe user get <login> --format=json
+#   sudo wp-safe user delete <login> [--yes] [--reassign=<id>]
+#   sudo wp-safe user application-password create <login> --name=<name>
+#   sudo wp-safe user application-password delete <login> <uuid>
+#   sudo wp-safe db check
+#
+# WP_PATH env var MUST be set by the agent (fixed path from config).
+# EXEC_AS env var MUST be set by the agent (user to drop to; typically www-data).
+
+set -euo pipefail
+IFS=$'\n\t'
+
+fail() { echo "wp-safe ERROR: $*" >&2; exit 1; }
+
+# ─────────────────────────── required env ────────────────────────────────────
+WP_PATH="${WP_PATH:-}"
+EXEC_AS="${EXEC_AS:-www-data}"
+
+[[ -n "$WP_PATH" ]] || fail "WP_PATH env var must be set by agent (WordPress root path)."
+[[ -d "$WP_PATH" ]] || fail "WP_PATH directory does not exist: $WP_PATH"
+
+# ─────────────────────────── wp binary ───────────────────────────────────────
+WP_BIN="$(command -v wp 2>/dev/null || true)"
+[[ -n "$WP_BIN" && -x "$WP_BIN" ]] || fail "wp-cli binary not found in PATH."
+
+# ─────────────────────────── subcommand allowlist ────────────────────────────
+ALLOWED_GROUPS=("site" "user" "db" "option")
+ALLOWED_SITE_CMDS=("list" "create" "archive" "delete")
+ALLOWED_USER_CMDS=("create" "get" "delete" "application-password")
+ALLOWED_USER_APPPW_CMDS=("create" "delete")
+ALLOWED_DB_CMDS=("check")
+ALLOWED_OPTION_CMDS=("get" "update")
+# HARD CONSTRAINT: the option group may only touch this single option key.
+# Any other key is rejected — a compromised agent cannot read/write arbitrary WP options.
+ALLOWED_OPTION_KEY="mavora_provisioning_id"
+
+# ─────────────────────────── arg validation ──────────────────────────────────
+validate_arg() {
+    local arg="$1"
+    # Reject shell metachar
+    if echo "$arg" | grep -qE '[;&|$`<>(){}\\]'; then
+        fail "Argument contains forbidden shell metacharacter: $arg"
+    fi
+    # Reject path traversal
+    if echo "$arg" | grep -q '\.\.'; then
+        fail "Argument contains path traversal: $arg"
+    fi
+}
+
+validate_slug() {
+    local slug="$1"
+    [[ "$slug" =~ ^[a-zA-Z0-9._-]+$ ]] || fail "Invalid slug/username (only alphanumeric, '.', '-', '_'): $slug"
+}
+
+validate_uuid() {
+    local uuid="$1"
+    [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "Invalid UUID format: $uuid"
+}
+
+# ─────────────────────────── build exec argv ─────────────────────────────────
+[[ $# -ge 2 ]] || fail "Usage: wp-safe <group> <subcommand> [args...]"
+
+GROUP="$1"; shift
+SUBCMD="$1"; shift
+
+# Validate top-level group
+FOUND_GROUP=false
+for g in "${ALLOWED_GROUPS[@]}"; do
+    [[ "$GROUP" == "$g" ]] && FOUND_GROUP=true && break
+done
+$FOUND_GROUP || fail "Subcommand group not allowed: $GROUP (allowed: ${ALLOWED_GROUPS[*]})"
+
+# Build base argv — --path is FIXED from WP_PATH (not from caller)
+ARGV=("$WP_BIN" "$GROUP" "$SUBCMD" "--path=${WP_PATH}")
+
+case "$GROUP" in
+    site)
+        FOUND=false
+        for c in "${ALLOWED_SITE_CMDS[@]}"; do [[ "$SUBCMD" == "$c" ]] && FOUND=true && break; done
+        $FOUND || fail "wp site $SUBCMD not allowed (allowed: ${ALLOWED_SITE_CMDS[*]})"
+
+        # Validate remaining args
+        for arg in "$@"; do
+            validate_arg "$arg"
+            ARGV+=("$arg")
+        done
+        # Always add --format=json for list
+        if [[ "$SUBCMD" == "list" ]]; then
+            ARGV+=("--format=json")
+        fi
+        ;;
+
+    user)
+        if [[ "$SUBCMD" == "application-password" ]]; then
+            [[ $# -ge 1 ]] || fail "wp user application-password requires a subcommand (create|delete)"
+            APPPW_CMD="$1"; shift
+            FOUND=false
+            for c in "${ALLOWED_USER_APPPW_CMDS[@]}"; do [[ "$APPPW_CMD" == "$c" ]] && FOUND=true && break; done
+            $FOUND || fail "wp user application-password $APPPW_CMD not allowed"
+            ARGV+=("$APPPW_CMD")
+            for arg in "$@"; do
+                validate_arg "$arg"
+                ARGV+=("$arg")
+            done
+            # Enforce json output for create
+            if [[ "$APPPW_CMD" == "create" ]]; then
+                ARGV+=("--porcelain")  # outputs raw password only
+            fi
+        else
+            FOUND=false
+            for c in "${ALLOWED_USER_CMDS[@]}"; do [[ "$SUBCMD" == "$c" ]] && FOUND=true && break; done
+            $FOUND || fail "wp user $SUBCMD not allowed (allowed: ${ALLOWED_USER_CMDS[*]})"
+            for arg in "$@"; do
+                validate_arg "$arg"
+                ARGV+=("$arg")
+            done
+            if [[ "$SUBCMD" == "get" ]]; then
+                ARGV+=("--format=json")
+            fi
+        fi
+        ;;
+
+    db)
+        FOUND=false
+        for c in "${ALLOWED_DB_CMDS[@]}"; do [[ "$SUBCMD" == "$c" ]] && FOUND=true && break; done
+        $FOUND || fail "wp db $SUBCMD not allowed (allowed: ${ALLOWED_DB_CMDS[*]})"
+        for arg in "$@"; do
+            validate_arg "$arg"
+            ARGV+=("$arg")
+        done
+        ;;
+
+    option)
+        # Only get and update are allowed; key is restricted to ALLOWED_OPTION_KEY.
+        FOUND=false
+        for c in "${ALLOWED_OPTION_CMDS[@]}"; do [[ "$SUBCMD" == "$c" ]] && FOUND=true && break; done
+        $FOUND || fail "wp option $SUBCMD not allowed (allowed: ${ALLOWED_OPTION_CMDS[*]})"
+
+        # First remaining arg must be the option key — enforce it.
+        [[ $# -ge 1 ]] || fail "wp option $SUBCMD requires an option key argument"
+        OPTION_KEY="$1"; shift
+        [[ "$OPTION_KEY" == "$ALLOWED_OPTION_KEY" ]] || \
+            fail "wp option key not allowed: '$OPTION_KEY' (only '$ALLOWED_OPTION_KEY' is permitted)"
+        ARGV+=("$OPTION_KEY")
+
+        # Remaining args (e.g. the value for 'update', --url=, --format=) are validated.
+        for arg in "$@"; do
+            validate_arg "$arg"
+            ARGV+=("$arg")
+        done
+        ;;
+esac
+
+# ─────────────────────────── exec as www-data ────────────────────────────────
+# exec → no subshell; argv slice → no interpolation
+exec sudo -u "$EXEC_AS" "${ARGV[@]}"

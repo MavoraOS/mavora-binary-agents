@@ -1,0 +1,30 @@
+# /etc/sudoers.d/mavora-agent — Mavora Agent sudo allowlist
+# SP-T-216 / agent/05 §37.3
+#
+# NARROW ALLOWLIST — no wildcards, no ALL=(ALL), no NOPASSWD ALL
+# Validate with: visudo -c -f /etc/sudoers.d/mavora-agent
+# The installer runs visudo -c before placing this file (refuses on syntax error).
+#
+# Allowed operations only:
+#   nginx -t              → validate nginx config (read-only)
+#   systemctl reload nginx → safe reload (NOT restart)
+#   write-vhost helper    → root-owned 0755, validates argv before writing
+#   wp-safe helper        → root-owned 0755, subcommand allowlist + www-data drop
+#
+# Firewall entry is commented — only uncomment if firewall_enabled=true (SP-BR-17).
+
+# nginx config test (read-only, no state change)
+mavora-agent ALL=(root) NOPASSWD: /usr/sbin/nginx -t
+
+# nginx safe reload (NOT restart — preserves running connections)
+mavora-agent ALL=(root) NOPASSWD: /bin/systemctl reload nginx
+
+# write-vhost helper: writes nginx vhost config to sites-available only
+# Helper validates: allowed filename format, no path traversal, no shell metachar
+mavora-agent ALL=(root) NOPASSWD: /opt/mavora-agent/bin/write-vhost
+
+# wp-safe helper: allowlisted WP-CLI operations, drops to www-data, fixed --path
+mavora-agent ALL=(root) NOPASSWD: /opt/mavora-agent/bin/wp-safe
+
+# Optional firewall allowlist helper (uncomment ONLY when firewall_enabled=true)
+# mavora-agent ALL=(root) NOPASSWD: /opt/mavora-agent/bin/firewall-apply
