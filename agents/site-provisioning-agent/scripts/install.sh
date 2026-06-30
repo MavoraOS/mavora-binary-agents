@@ -346,7 +346,20 @@ bootstrap_exchange() {
     printf '%s\n' "$signed_cert" > "$TLS_CERT"
     printf '%s\n' "$ca_cert"     > "$CA_CERT"
     printf '%s\n' "$connection_key" > "$BEARER_FILE"
-    printf '%s\n' "$ed25519_pubkey" > "$ED25519_PUB"
+    # ed25519_pubkey arrives as base64url(no padding) raw 32-byte key, but the agent
+    # loads it as a PEM PKIX file (auth.loadOnePEMKey → pem.Decode → ParsePKIXPublicKey).
+    # Wrap the raw key in the standard Ed25519 SubjectPublicKeyInfo header + PEM.
+    printf '%s' "$ed25519_pubkey" | python3 -c '
+import base64, sys, textwrap
+b64 = sys.stdin.read().strip()
+raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+if len(raw) != 32:
+    sys.stderr.write("ed25519 pubkey is %d bytes, want 32\n" % len(raw)); sys.exit(1)
+der = bytes.fromhex("302a300506032b6570032100") + raw
+print("-----BEGIN PUBLIC KEY-----")
+print("\n".join(textwrap.wrap(base64.b64encode(der).decode(), 64)))
+print("-----END PUBLIC KEY-----")
+' > "$ED25519_PUB" || fail "Failed to convert ed25519 pubkey to PEM PKIX"
 
     # Promote temp key to final location
     mv "$key_tmp" "$TLS_KEY"
