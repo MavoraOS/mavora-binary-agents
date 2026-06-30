@@ -326,13 +326,14 @@ bootstrap_exchange() {
         fail "Bootstrap returned HTTP $http_code. Check token validity and control-plane URL."
     fi
 
-    # Parse response fields — never log raw values
+    # Parse response fields — never log raw values. The BE wraps the bootstrap payload
+    # in the ADR-030 {"data":{...}} envelope, so unwrap "data" (fall back to top-level).
     local signed_cert ca_cert connection_key ed25519_pubkey signing_key_id
-    signed_cert="$(python3 -c "import json,sys; d=json.load(open('$response_file')); print(d.get('signed_cert',''))")"
-    ca_cert="$(python3 -c "import json,sys; d=json.load(open('$response_file')); print(d.get('ca',''))")"
-    connection_key="$(python3 -c "import json,sys; d=json.load(open('$response_file')); print(d.get('connection_key',''))")"
-    ed25519_pubkey="$(python3 -c "import json,sys; d=json.load(open('$response_file')); print(d.get('ed25519_pubkey',''))")"
-    signing_key_id="$(python3 -c "import json,sys; d=json.load(open('$response_file')); print(d.get('signing_key_id',''))")"
+    signed_cert="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('signed_cert',''))")"
+    ca_cert="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('ca',''))")"
+    connection_key="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('connection_key',''))")"
+    ed25519_pubkey="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('ed25519_pubkey',''))")"
+    signing_key_id="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('signing_key_id',''))")"
 
     [[ -n "$signed_cert" ]] || fail "Bootstrap response missing signed_cert."
     [[ -n "$ca_cert" ]] || fail "Bootstrap response missing ca (CA certificate)."
