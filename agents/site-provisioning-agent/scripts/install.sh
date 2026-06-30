@@ -65,8 +65,10 @@ BEARER_FILE="${CONF_DIR}/bearer.token"
 ED25519_PUB="${CONF_DIR}/signing.pub"
 
 # ─────────────────────────── logging ────────────────────────────────────────
-log()  { echo "[install] $*"; }
-info() { echo "[install] INFO:  $*"; }
+# All human-readable logs go to STDERR so they never pollute a function's stdout
+# when captured via command substitution (e.g. csr_file="$(generate_mtls_keypair)").
+log()  { echo "[install] $*" >&2; }
+info() { echo "[install] INFO:  $*" >&2; }
 warn() { echo "[install] WARN:  $*" >&2; }
 fail() { echo "[install] ERROR: $*" >&2; exit 1; }
 
