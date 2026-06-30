@@ -295,8 +295,10 @@ bootstrap_exchange() {
             fail "Could not fetch agent CA from $CA_URL (needed to trust the agent gateway). Override with --ca-url <url>, or --ca-url \"\" if the gateway uses a public cert."
         fi
     fi
-    # Ensure temp files are deleted even on error
-    trap 'rm -f "$response_file" "$ca_tmp"' RETURN
+    # Ensure temp files are deleted even on error. Use ${var:-} so the RETURN trap
+    # never trips `set -u` if it fires again after later functions return (the vars
+    # are function-local to bootstrap_exchange and unset in those later scopes).
+    trap 'rm -f "${response_file:-}" "${ca_tmp:-}"' RETURN
 
     info "Exchanging install token for credentials (bootstrap)..."
 
