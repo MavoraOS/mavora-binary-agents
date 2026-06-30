@@ -19,6 +19,10 @@
 #   --user <name>            Service account name (default: mavora-agent)
 #   --nginx-available <path> nginx sites-available (default: /etc/nginx/sites-available)
 #   --nginx-enabled <path>   nginx sites-enabled (default: /etc/nginx/sites-enabled)
+#   --php-fpm-socket <s>     fastcgi_pass target. Default per OS — Ubuntu:
+#                            unix:/run/php/php8.1-fpm.sock · RHEL/AlmaLinux:
+#                            unix:/run/php-fpm/www.sock
+# Supported OS: Ubuntu 22.04/24.04, AlmaLinux/Rocky/RHEL 8/9.
 #   --rotate                 Re-exchange credentials (rotate mode, preserves existing service)
 #
 # Security invariants:
@@ -72,6 +76,8 @@ TOKEN_FILE=""
 CONTROL_PLANE=""
 LOCAL_BINARY=""
 ROTATE=false
+PHP_FPM_SOCKET=""   # default set per-OS in check_os when not overridden
+OS_FAMILY=""        # debian | rhel — set by check_os
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -84,6 +90,7 @@ parse_args() {
             --user)         AGENT_USER="${2:-}"; shift 2 ;;
             --nginx-available) NGINX_AVAILABLE="${2:-}"; shift 2 ;;
             --nginx-enabled)   NGINX_ENABLED="${2:-}"; shift 2 ;;
+            --php-fpm-socket)  PHP_FPM_SOCKET="${2:-}"; shift 2 ;;
             --rotate)       ROTATE=true; shift ;;
             *) fail "Unknown flag: $1 (see comments for usage)" ;;
         esac
@@ -100,19 +107,39 @@ parse_args() {
 }
 
 # ─────────────────────────── step 1: OS check ───────────────────────────────
+# Supported: Ubuntu 22.04/24.04 (debian family) and AlmaLinux/Rocky/RHEL 8/9
+# (rhel family). Sets OS_FAMILY + a per-family php-fpm socket default.
 check_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        fail "Cannot detect OS. Supported: Ubuntu 22.04, Ubuntu 24.04."
-    fi
+    local supported="Ubuntu 22.04/24.04, AlmaLinux/Rocky/RHEL 8/9"
+    [[ -f /etc/os-release ]] || fail "Cannot detect OS. Supported: ${supported}."
     # shellcheck source=/dev/null
     source /etc/os-release
-    if [[ "$ID" != "ubuntu" ]]; then
-        fail "Unsupported OS: $ID. Supported: Ubuntu 22.04, Ubuntu 24.04."
-    fi
-    case "$VERSION_ID" in
-        22.04|24.04) info "OS check PASS: Ubuntu $VERSION_ID" ;;
-        *) fail "Unsupported Ubuntu version: $VERSION_ID. Supported: 22.04, 24.04." ;;
+    case "$ID" in
+        ubuntu)
+            case "$VERSION_ID" in
+                22.04|24.04) OS_FAMILY=debian; info "OS check PASS: Ubuntu $VERSION_ID" ;;
+                *) fail "Unsupported Ubuntu version: $VERSION_ID. Supported: 22.04, 24.04." ;;
+            esac ;;
+        almalinux|rocky|rhel|centos)
+            case "${VERSION_ID%%.*}" in
+                8|9) OS_FAMILY=rhel; info "OS check PASS: $ID $VERSION_ID (RHEL family)" ;;
+                *) fail "Unsupported $ID version: $VERSION_ID. Supported: 8, 9." ;;
+            esac ;;
+        *)
+            case " ${ID_LIKE:-} " in
+                *" rhel "*|*" fedora "*) OS_FAMILY=rhel; warn "OS '$ID' matched via ID_LIKE — proceeding as RHEL family (untested derivative)." ;;
+                *" debian "*)            OS_FAMILY=debian; warn "OS '$ID' matched via ID_LIKE — proceeding as Debian family (untested derivative)." ;;
+                *) fail "Unsupported OS: $ID. Supported: ${supported}." ;;
+            esac ;;
     esac
+    # Per-family php-fpm socket default (only when not given via --php-fpm-socket).
+    if [[ -z "$PHP_FPM_SOCKET" ]]; then
+        case "$OS_FAMILY" in
+            debian) PHP_FPM_SOCKET="unix:/run/php/php8.1-fpm.sock" ;;
+            rhel)   PHP_FPM_SOCKET="unix:/run/php-fpm/www.sock" ;;
+        esac
+    fi
+    info "OS family: $OS_FAMILY · php-fpm socket: $PHP_FPM_SOCKET"
 }
 
 # ─────────────────────────── step 2: prerequisites ──────────────────────────
@@ -137,8 +164,27 @@ create_user() {
     if id "$AGENT_USER" &>/dev/null; then
         info "User $AGENT_USER already exists — skipping."
     else
-        useradd --system --no-create-home --shell /usr/sbin/nologin "$AGENT_USER"
-        info "Created system user: $AGENT_USER (no home, nologin)."
+        # nologin lives at /usr/sbin/nologin on Ubuntu; /sbin/nologin on some RHEL.
+        local nologin=/usr/sbin/nologin
+        [[ -x "$nologin" ]] || nologin=/sbin/nologin
+        useradd --system --no-create-home --shell "$nologin" "$AGENT_USER"
+        info "Created system user: $AGENT_USER (no home, $nologin)."
+    fi
+}
+
+# ─────────────────────────── step: nginx vhost layout ───────────────────────
+# The agent writes vhosts to sites-available + symlinks into sites-enabled
+# (Debian convention). Ubuntu's nginx.conf already includes sites-enabled;
+# RHEL/AlmaLinux ships conf.d-only, so create the dirs and add the include via a
+# conf.d drop-in (no edit to nginx.conf). Idempotent.
+setup_nginx_layout() {
+    mkdir -p "$NGINX_AVAILABLE" "$NGINX_ENABLED"
+    if [[ "$OS_FAMILY" == "rhel" ]] && command -v nginx &>/dev/null; then
+        local dropin=/etc/nginx/conf.d/mavora-sites-enabled.conf
+        if [[ ! -f "$dropin" ]]; then
+            printf 'include %s/*.conf;\n' "$NGINX_ENABLED" > "$dropin"
+            info "nginx: added include for ${NGINX_ENABLED} via ${dropin}"
+        fi
     fi
 }
 
@@ -328,6 +374,7 @@ signing_key_ids:
 webroot: "${WEBROOT}"
 nginx_sites_available: "${NGINX_AVAILABLE}"
 nginx_sites_enabled: "${NGINX_ENABLED}"
+php_fpm_socket: "${PHP_FPM_SOCKET}"
 state_dir_path: "${STATE_DIR}"
 heartbeat_interval_sec: 30
 poll_timeout_sec: 35
@@ -483,6 +530,7 @@ main() {
     check_prereqs
     create_user
     create_dirs
+    setup_nginx_layout
     install_binary
 
     # Generate keypair + CSR (private key stays on this VPS)
