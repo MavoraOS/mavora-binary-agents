@@ -22,6 +22,9 @@
 #   --php-fpm-socket <s>     fastcgi_pass target. Default per OS — Ubuntu:
 #                            unix:/run/php/php8.1-fpm.sock · RHEL/AlmaLinux:
 #                            unix:/run/php-fpm/www.sock
+#   --ca-url <url>           Public URL serving the agent CA cert (default Mavora
+#                            prod). Fetched to trust the agent gateway at bootstrap —
+#                            no manual per-host CA copy. Use --ca-url "" for system trust.
 # Supported OS: Ubuntu 22.04/24.04, AlmaLinux/Rocky/RHEL 8/9.
 #   --rotate                 Re-exchange credentials (rotate mode, preserves existing service)
 #
@@ -80,6 +83,10 @@ LOCAL_BINARY=""
 ROTATE=false
 PHP_FPM_SOCKET=""   # default set per-OS in check_os when not overridden
 OS_FAMILY=""        # debian | rhel — set by check_os
+# Public endpoint serving the agent CA (public cert only). install.sh fetches it to
+# trust the self-signed agent gateway at bootstrap — no manual per-host CA copy
+# (Option C). Override per deployment; set to "" to skip (gateway has a public cert).
+CA_URL="https://api.mavoraos.com/api/v1/provisioning/agent-ca"
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -93,6 +100,7 @@ parse_args() {
             --nginx-available) NGINX_AVAILABLE="${2:-}"; shift 2 ;;
             --nginx-enabled)   NGINX_ENABLED="${2:-}"; shift 2 ;;
             --php-fpm-socket)  PHP_FPM_SOCKET="${2:-}"; shift 2 ;;
+            --ca-url)       CA_URL="${2:-}"; shift 2 ;;
             --rotate)       ROTATE=true; shift ;;
             *) fail "Unknown flag: $1 (see comments for usage)" ;;
         esac
@@ -271,8 +279,24 @@ bootstrap_exchange() {
 
     csr_pem="$(cat "$csr_file")"
     response_file="$(mktemp /tmp/mavora-bootstrap-XXXXXX.json)"
-    # Ensure temp response is deleted even on error
-    trap 'rm -f "$response_file"' RETURN
+
+    # Fetch the agent CA (public cert) from the public endpoint so curl can verify
+    # the self-signed agent gateway at bootstrap — no manual per-host CA copy
+    # (Option C). --ca-url "" skips this (gateway must have a publicly-trusted cert).
+    local ca_tmp="" ca_args=()
+    if [[ -n "$CA_URL" ]]; then
+        ca_tmp="$(mktemp /tmp/mavora-bootstrap-ca-XXXXXX.pem)"
+        if curl --fail --silent --show-error --max-time 30 -o "$ca_tmp" "$CA_URL" \
+            && grep -q "BEGIN CERTIFICATE" "$ca_tmp"; then
+            ca_args=(--cacert "$ca_tmp")
+            info "Fetched agent CA from $CA_URL"
+        else
+            rm -f "$ca_tmp" "$response_file"
+            fail "Could not fetch agent CA from $CA_URL (needed to trust the agent gateway). Override with --ca-url <url>, or --ca-url \"\" if the gateway uses a public cert."
+        fi
+    fi
+    # Ensure temp files are deleted even on error
+    trap 'rm -f "$response_file" "$ca_tmp"' RETURN
 
     info "Exchanging install token for credentials (bootstrap)..."
 
@@ -290,6 +314,7 @@ bootstrap_exchange() {
         --max-time 30 \
         --write-out "%{http_code}" \
         --output "$response_file" \
+        ${ca_args[@]+"${ca_args[@]}"} \
         -X POST \
         -H "Content-Type: application/json" \
         "${CONTROL_PLANE}/agent/v1/bootstrap" \
