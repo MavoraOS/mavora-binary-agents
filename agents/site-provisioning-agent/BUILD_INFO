@@ -1,9 +1,9 @@
 agent:        site-provisioning-agent
-version:      0.1.0-ae514fc
-git_sha:      ae514fc266c8c6ca98949c63b1c5245d7d7fca27
+version:      0.1.0-70a3758
+git_sha:      70a37582b0739aef00222b029daac1e96a27cd95
 git_branch:   main
-built_at:     2026-06-30T12:14:23Z
+built_at:     2026-07-01T14:36:07Z
 go_version:   go1.26.0
 targets:      linux/amd64, linux/arm64
-build_flags:  CGO_ENABLED=0 -trimpath -ldflags "-s -w -X main.AgentVersion=0.1.0-ae514fc -X main.ProtocolVersion=1 -X main.MinProtocolVersion=1 -X main.MaxProtocolVersion=1"
+build_flags:  CGO_ENABLED=0 -trimpath -ldflags "-s -w -X main.AgentVersion=0.1.0-70a3758 -X main.ProtocolVersion=1 -X main.MinProtocolVersion=1 -X main.MaxProtocolVersion=1"
 source_repo:  github.com/MavoraOS/site-provisioning-agent
