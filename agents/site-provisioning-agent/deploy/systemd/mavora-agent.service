@@ -1,14 +1,17 @@
 # mavora-agent.service — systemd unit for the Mavora Site Provisioning Agent
 # SP-T-216 / agent/05 §37
 #
-# Hardening notes:
+# Security model: the agent runs as root and execs its helpers (write-vhost,
+# wp-safe, firewall-apply) and system binaries (nginx -t, systemctl reload nginx)
+# DIRECTLY — there is no sudo. The privilege boundary is:
+#
 #   ProtectSystem=strict  → whole FS read-only except ReadWritePaths
-#   ReadWritePaths        → webroot + nginx dirs + state dir (MUST include webroot
-#                           so WP-CLI run via sudo www-data can write uploads/cache)
-#   CapabilityBoundingSet= → empty: drop ALL capabilities; sudo provides allowlist
-#   NoNewPrivileges=no    → sudo setuid escalation allowed (required); sudoers
-#                           NOPASSWD allowlist at deploy/sudoers/mavora-agent is
-#                           the privilege boundary (write-vhost, wp-safe, nginx, systemctl)
+#   ReadWritePaths        → webroot + nginx dirs + state dir
+#   CapabilityBoundingSet= → empty: all Linux capabilities dropped
+#   AmbientCapabilities=  → empty
+#   SystemCallFilter=@system-service → restrict to service-appropriate syscalls
+#
+# Other hardening still in force:
 #   ProtectHome=yes       → no access to /home or /root
 #   PrivateTmp=yes        → isolated /tmp per service
 #   ProtectKernelTunables=yes → cannot write /proc/sys or sysctl
@@ -17,14 +20,16 @@
 #   RestrictSUIDSGID=yes  → cannot set SUID/SGID bits
 #   LockPersonality=yes   → cannot change execution domain
 #   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX → minimal socket families
-#   SystemCallFilter=@system-service → restrict to service-appropriate syscalls
+#
+# NOTE: deploy/sudoers/mavora-agent is now VESTIGIAL (no longer used by the
+# service). It is left in the repo for reference; install.sh still installs it
+# for backwards compatibility but the agent never invokes sudo.
 #
 # MemoryDenyWriteExecute intentionally OMITTED:
-#   WP-CLI is invoked indirectly via wp-safe helper which runs PHP under www-data.
-#   Some PHP/OPcache-JIT configurations require W+X memory pages. MDWE would cause
-#   WP-CLI to crash silently on affected PHP versions. If the fleet PHP CLI has JIT
-#   disabled (opcache.jit=0), MDWE=yes can be re-added for stronger hardening.
-#   See agent/05 §37.4 for details.
+#   wp-safe helper runs PHP under www-data. Some PHP/OPcache-JIT configurations
+#   require W+X memory pages. MDWE would cause WP-CLI to crash silently on
+#   affected PHP versions. If the fleet PHP CLI has JIT disabled (opcache.jit=0),
+#   MDWE=yes can be re-added for stronger hardening. See agent/05 §37.4 for details.
 #
 # IMPORTANT: ReadWritePaths values are injected by install.sh at install time.
 #   The PLACEHOLDER_ tokens below are replaced during installation.
@@ -43,8 +48,8 @@ ConditionPathExists=/etc/mavora-agent/config.yaml
 
 [Service]
 Type=simple
-User=mavora-agent
-Group=mavora-agent
+User=root
+Group=root
 
 ExecStart=PLACEHOLDER_BINARY_PATH
 
@@ -54,18 +59,10 @@ StartLimitInterval=60
 StartLimitBurst=5
 
 # ── Hardening ──────────────────────────────────────────────────────────────
-# Drop all capabilities; allowlisted sudo commands handle privileged ops.
+# Drop all Linux capabilities — root process with empty CapabilityBoundingSet
+# cannot acquire any capability beyond what it already holds at service start.
 CapabilityBoundingSet=
 AmbientCapabilities=
-
-# NoNewPrivileges=no: sudo requires its setuid bit to escalate to root.
-# Setting NoNewPrivileges=yes blocks setuid escalation and therefore breaks sudo.
-# The narrow NOPASSWD sudoers allowlist at deploy/sudoers/mavora-agent is the
-# privilege boundary — only /usr/sbin/nginx -t, /bin/systemctl reload nginx,
-# /opt/mavora-agent/bin/write-vhost, and /opt/mavora-agent/bin/wp-safe are
-# permitted. All other hardening (CapabilityBoundingSet=, ProtectSystem=strict,
-# RestrictSUIDSGID=yes, etc.) remains in force.
-NoNewPrivileges=no
 
 # Whole filesystem read-only except ReadWritePaths.
 ProtectSystem=strict
@@ -104,8 +101,8 @@ SystemCallErrorNumber=EPERM
 # MUST include:
 #   - state_dir:        idempotency store (JSON + flock)
 #   - log_dir:          structured log output
-#   - nginx sites dirs: write-vhost helper writes here (via sudo)
-#   - webroot:          WP-CLI (as www-data via sudo) writes uploads/cache
+#   - nginx sites dirs: write-vhost helper writes here (direct exec as root)
+#   - webroot:          WP-CLI (as www-data via wp-safe) writes uploads/cache
 #
 # These are PLACEHOLDER_ tokens replaced by install.sh with actual paths.
 ReadWritePaths=PLACEHOLDER_WEBROOT PLACEHOLDER_NGINX_SITES_AVAILABLE PLACEHOLDER_NGINX_SITES_ENABLED PLACEHOLDER_STATE_DIR /var/log/mavora-agent
