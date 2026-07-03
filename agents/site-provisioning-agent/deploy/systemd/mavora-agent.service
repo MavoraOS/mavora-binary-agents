@@ -6,9 +6,9 @@
 #   ReadWritePaths        → webroot + nginx dirs + state dir (MUST include webroot
 #                           so WP-CLI run via sudo www-data can write uploads/cache)
 #   CapabilityBoundingSet= → empty: drop ALL capabilities; sudo provides allowlist
-#   NoNewPrivileges=yes   → no suid/capability escalation (sudo policy still works
-#                           because NoNewPrivileges blocks setuid escalation, not
-#                           already-configured sudo policy entries)
+#   NoNewPrivileges=no    → sudo setuid escalation allowed (required); sudoers
+#                           NOPASSWD allowlist at deploy/sudoers/mavora-agent is
+#                           the privilege boundary (write-vhost, wp-safe, nginx, systemctl)
 #   ProtectHome=yes       → no access to /home or /root
 #   PrivateTmp=yes        → isolated /tmp per service
 #   ProtectKernelTunables=yes → cannot write /proc/sys or sysctl
@@ -58,8 +58,14 @@ StartLimitBurst=5
 CapabilityBoundingSet=
 AmbientCapabilities=
 
-# No new privilege escalation via suid/sgid (sudo policy still works).
-NoNewPrivileges=yes
+# NoNewPrivileges=no: sudo requires its setuid bit to escalate to root.
+# Setting NoNewPrivileges=yes blocks setuid escalation and therefore breaks sudo.
+# The narrow NOPASSWD sudoers allowlist at deploy/sudoers/mavora-agent is the
+# privilege boundary — only /usr/sbin/nginx -t, /bin/systemctl reload nginx,
+# /opt/mavora-agent/bin/write-vhost, and /opt/mavora-agent/bin/wp-safe are
+# permitted. All other hardening (CapabilityBoundingSet=, ProtectSystem=strict,
+# RestrictSUIDSGID=yes, etc.) remains in force.
+NoNewPrivileges=no
 
 # Whole filesystem read-only except ReadWritePaths.
 ProtectSystem=strict
