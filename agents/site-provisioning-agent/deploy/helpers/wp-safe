@@ -29,18 +29,34 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# PATH may be a restricted secure_path under sudo/systemd (excludes /usr/local/bin,
+# the usual wp-cli + php location). Prepend common bin dirs so wp-cli and its php
+# interpreter resolve regardless of how the agent process was launched.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
 fail() { echo "wp-safe ERROR: $*" >&2; exit 1; }
 
 # ─────────────────────────── required env ────────────────────────────────────
 WP_PATH="${WP_PATH:-}"
-EXEC_AS="${EXEC_AS:-www-data}"
 
 [[ -n "$WP_PATH" ]] || fail "WP_PATH env var must be set by agent (WordPress root path)."
 [[ -d "$WP_PATH" ]] || fail "WP_PATH directory does not exist: $WP_PATH"
 
+# Drop-to user: honour an agent-set EXEC_AS, else auto-detect from the WordPress
+# root owner — nginx on RHEL/AlmaLinux, www-data on Debian/Ubuntu. Auto-detection
+# avoids per-OS config drift; the root owner is the user that must own WP writes.
+EXEC_AS="${EXEC_AS:-$(stat -c '%U' "$WP_PATH")}"
+[[ -n "$EXEC_AS" ]] || fail "cannot determine EXEC_AS (WordPress root owner)."
+id -u "$EXEC_AS" >/dev/null 2>&1 || fail "EXEC_AS user does not exist: $EXEC_AS"
+
 # ─────────────────────────── wp binary ───────────────────────────────────────
 WP_BIN="$(command -v wp 2>/dev/null || true)"
-[[ -n "$WP_BIN" && -x "$WP_BIN" ]] || fail "wp-cli binary not found in PATH."
+if [[ -z "$WP_BIN" ]]; then
+    for cand in /usr/local/bin/wp /usr/bin/wp /bin/wp /usr/local/sbin/wp /snap/bin/wp; do
+        [[ -x "$cand" ]] && { WP_BIN="$cand"; break; }
+    done
+fi
+[[ -n "$WP_BIN" && -x "$WP_BIN" ]] || fail "wp-cli binary not found in PATH or common locations (/usr/local/bin/wp, /usr/bin/wp)."
 
 # ─────────────────────────── subcommand allowlist ────────────────────────────
 ALLOWED_GROUPS=("site" "user" "db" "option")
