@@ -13,7 +13,7 @@
 #
 # Usage (called by agent via sudo):
 #   sudo wp-safe site list [--url=<url>] [--format=json]
-#   sudo wp-safe site create --slug=<slug> [--title=<title>]
+#   sudo wp-safe site create-mapped <domain> [<title>]   # wpmu_create_blog(domain,'/',...)
 #   sudo wp-safe site archive --slug=<slug>
 #   sudo wp-safe site delete --slug=<slug> [--yes]
 #   sudo wp-safe user create <login> <email> --role=<role>
@@ -60,7 +60,10 @@ fi
 
 # ─────────────────────────── subcommand allowlist ────────────────────────────
 ALLOWED_GROUPS=("site" "user" "db" "option")
-ALLOWED_SITE_CMDS=("list" "create" "archive" "delete")
+# create-mapped is handled by a dedicated branch below (it is NOT a real WP-CLI
+# subcommand — it runs wpmu_create_blog via `wp eval`), so it is intentionally
+# absent from this generic list.
+ALLOWED_SITE_CMDS=("list" "archive" "delete")
 ALLOWED_USER_CMDS=("create" "get" "delete" "application-password")
 ALLOWED_USER_APPPW_CMDS=("create" "delete")
 ALLOWED_DB_CMDS=("check")
@@ -110,6 +113,34 @@ ARGV=("$WP_BIN" "$GROUP" "$SUBCMD" "--path=${WP_PATH}")
 
 case "$GROUP" in
     site)
+        # ── create-mapped: bind a subsite to a FULL separate domain ──────────────
+        # WP-CLI `site create --slug` can only build a domain from the network root;
+        # mapping an arbitrary separate domain requires wpmu_create_blog(domain,'/',…),
+        # which inserts wp_blogs.domain=<domain>, path='/' directly. WordPress core then
+        # serves that domain by matching wp_blogs.domain — no sunrise.php / domain-mapping
+        # plugin needed. This is a dedicated, tightly-scoped op: the PHP template is FIXED
+        # here and ONLY the strictly-validated domain + title are substituted, so the
+        # caller cannot inject PHP (both are constrained to a metachar-free charset).
+        if [[ "$SUBCMD" == "create-mapped" ]]; then
+            [[ $# -ge 1 ]] || fail "wp site create-mapped requires <domain> [<title>]"
+            # lowercase — WP stores domains lowercase (tr for shell portability).
+            MAP_DOMAIN="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; shift
+            MAP_TITLE="${1:-$MAP_DOMAIN}"
+            [[ $# -ge 1 ]] && shift || true
+            # Strict DNS-hostname regex — no shell/PHP metacharacter can pass (the value
+            # is interpolated into a double-quoted PHP string below).
+            DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+            [[ "$MAP_DOMAIN" =~ $DOMAIN_RE ]] || fail "Invalid domain for create-mapped: $MAP_DOMAIN"
+            # Title: printable safe subset only (letters/digits/space/dot/underscore/hyphen).
+            TITLE_RE='^[A-Za-z0-9._ -]+$'
+            [[ "$MAP_TITLE" =~ $TITLE_RE ]] || fail "Invalid title for create-mapped: $MAP_TITLE"
+            # FIXED PHP template — only the validated $MAP_DOMAIN / $MAP_TITLE are substituted.
+            PHP_CODE="\$id = wpmu_create_blog(\"${MAP_DOMAIN}\", \"/\", \"${MAP_TITLE}\", 1);"
+            PHP_CODE+=" if ( is_wp_error( \$id ) ) { fwrite( STDERR, 'WPERR:' . \$id->get_error_code() ); exit( 1 ); }"
+            PHP_CODE+=" echo (int) \$id;"
+            exec sudo -u "$EXEC_AS" "$WP_BIN" eval "$PHP_CODE" "--path=${WP_PATH}"
+        fi
+
         FOUND=false
         for c in "${ALLOWED_SITE_CMDS[@]}"; do [[ "$SUBCMD" == "$c" ]] && FOUND=true && break; done
         $FOUND || fail "wp site $SUBCMD not allowed (allowed: ${ALLOWED_SITE_CMDS[*]})"

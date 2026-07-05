@@ -1,9 +1,9 @@
 agent:        site-provisioning-agent
-version:      0.1.0-fa16b3b
-git_sha:      fa16b3b56925486778ca2a2977dc678c807d680f
-git_branch:   main
-built_at:     2026-07-03T04:01:18Z
-go_version:   go1.26.0
+version:      0.1.0-be4c779
+git_sha:      be4c77964eb4fad8c48e53477d56d68033771d35
+git_branch:   fix/wp-createsubsite-mapped-domain
+built_at:     2026-07-05T14:52:24Z
+go_version:   go1.26.1
 targets:      linux/amd64, linux/arm64
-build_flags:  CGO_ENABLED=0 -trimpath -ldflags "-s -w -X main.AgentVersion=0.1.0-fa16b3b -X main.ProtocolVersion=1 -X main.MinProtocolVersion=1 -X main.MaxProtocolVersion=1"
+build_flags:  CGO_ENABLED=0 -trimpath -ldflags "-s -w -X main.AgentVersion=0.1.0-be4c779 -X main.ProtocolVersion=1 -X main.MinProtocolVersion=1 -X main.MaxProtocolVersion=1"
 source_repo:  github.com/MavoraOS/site-provisioning-agent
