@@ -76,10 +76,15 @@ op_write() {
     chmod 0644 "$tmp"
     mv "$tmp" "$dest"
 
-    # Create symlink (enable)
-    ln -sfn "$dest" "$link"
-
-    echo "write-vhost: wrote $dest + symlink $link"
+    # Flat layout (e.g. sites-available == sites-enabled == conf.d): the file is already
+    # in the dir nginx includes, so no symlink is needed. `ln -sfn "$dest" "$dest"` would
+    # replace the just-written file with a broken self-symlink, so skip it.
+    if [[ "$dest" == "$link" ]]; then
+        echo "write-vhost: wrote $dest (flat layout — no symlink)"
+    else
+        ln -sfn "$dest" "$link"
+        echo "write-vhost: wrote $dest + symlink $link"
+    fi
 }
 
 # ─────────────────────────── op: remove ─────────────────────────────────────
@@ -95,7 +100,11 @@ op_remove() {
     local conf="${sites_available}/${filename}"
     local link="${sites_enabled}/${filename}"
 
-    rm -f "$link" && echo "write-vhost: removed symlink $link (if existed)"
+    # Flat layout: link == conf, so only remove the file once (removing the symlink path
+    # first would delete the config itself).
+    if [[ "$link" != "$conf" ]]; then
+        rm -f "$link" && echo "write-vhost: removed symlink $link (if existed)"
+    fi
     rm -f "$conf" && echo "write-vhost: removed config $conf (if existed)"
 }
 
@@ -113,8 +122,12 @@ op_enable() {
     local link="${sites_enabled}/${filename}"
 
     [[ -f "$conf" ]] || fail "Config does not exist: $conf"
-    ln -sfn "$conf" "$link"
-    echo "write-vhost: enabled symlink $link → $conf"
+    if [[ "$conf" == "$link" ]]; then
+        echo "write-vhost: $conf already in the included dir (flat layout — no symlink)"
+    else
+        ln -sfn "$conf" "$link"
+        echo "write-vhost: enabled symlink $link → $conf"
+    fi
 }
 
 # ─────────────────────────── main ───────────────────────────────────────────
