@@ -2,16 +2,19 @@
 # wp-safe — Allowlisted WP-CLI wrapper helper (SP-T-216)
 #
 # SECURITY INVARIANTS:
-#   - Root-owned 0755; called via sudoers allowlist only
+#   - Root-owned 0755; exec'd DIRECTLY by the root agent (no sudo/sudoers)
 #   - --path is FIXED from WP_PATH env var (set by agent from config, NOT from payload)
 #   - Only allowlisted subcommand groups are permitted
 #   - All argv is validated for metachar and traversal before exec
-#   - Drops to www-data before executing wp
+#   - Drops to the web user (EXEC_AS) via setpriv/runuser before executing wp.
+#     (NOT sudo: the hardened systemd unit sets NoNewPrivileges, which neuters the
+#     setuid sudo binary. setpriv/runuser use setuid() directly — the service holds
+#     CAP_SETUID/SETGID — so they drop privileges correctly under NoNewPrivileges.)
 #   - Uses argv array (exec, NO shell interpolation)
 #   - --format=json enforced on data-output commands
 #   - NEVER accepts --path from caller arguments (SSRF/traversal prevention)
 #
-# Usage (called by agent via sudo):
+# Usage (called directly by the root agent):
 #   sudo wp-safe site list [--url=<url>] [--format=json]
 #   sudo wp-safe site create-mapped <domain> [<title>]   # wpmu_create_blog(domain,'/',...)
 #   sudo wp-safe site archive --slug=<slug>
@@ -34,7 +37,33 @@ IFS=$'\n\t'
 # interpreter resolve regardless of how the agent process was launched.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
+# Pin the PHP interpreter for WP-CLI so it resolves even if the privilege-drop tool
+# sanitises PATH (setpriv preserves env; runuser may reset PATH).
+export WP_CLI_PHP="${WP_CLI_PHP:-$(command -v php 2>/dev/null || true)}"
+
 fail() { echo "wp-safe ERROR: $*" >&2; exit 1; }
+
+# drop_and_exec — exec the given argv as EXEC_AS (the web user), dropping root.
+# Uses a capability-based dropper, NOT sudo: under the hardened systemd unit
+# NoNewPrivileges is set, which neuters setuid binaries like sudo. setpriv/runuser
+# call setuid()/setgid() directly (the service holds CAP_SETUID/SETGID), so they
+# work under NoNewPrivileges. setpriv is preferred (preserves the full environment,
+# incl. the PATH/WP_CLI_PHP we exported); runuser and sudo are fallbacks.
+drop_and_exec() {
+    local gid home
+    gid="$(id -g "$EXEC_AS" 2>/dev/null || true)"
+    # setpriv preserves the environment, so point HOME at the web user's home (else
+    # HOME leaks as root's /root and WP-CLI cache writes fail). runuser/sudo reset it.
+    home="$(getent passwd "$EXEC_AS" 2>/dev/null | cut -d: -f6 || true)"
+    [[ -n "$home" ]] && export HOME="$home"
+    if [[ -n "$gid" ]] && command -v setpriv >/dev/null 2>&1; then
+        exec setpriv --reuid "$EXEC_AS" --regid "$gid" --init-groups -- "$@"
+    elif command -v runuser >/dev/null 2>&1; then
+        exec runuser -u "$EXEC_AS" -- "$@"
+    else
+        exec sudo -u "$EXEC_AS" -- "$@"
+    fi
+}
 
 # ─────────────────────────── required env ────────────────────────────────────
 WP_PATH="${WP_PATH:-}"
@@ -143,7 +172,7 @@ case "$GROUP" in
             PHP_CODE="\$id = wpmu_create_blog(\"${MAP_DOMAIN}\", \"/\", \"${MAP_TITLE}\", 1);"
             PHP_CODE+=" if ( is_wp_error( \$id ) ) { fwrite( STDERR, 'WPERR:' . \$id->get_error_code() ); exit( 1 ); }"
             PHP_CODE+=" echo (int) \$id;"
-            exec sudo -u "$EXEC_AS" "$WP_BIN" eval "$PHP_CODE" "--path=${WP_PATH}"
+            drop_and_exec "$WP_BIN" eval "$PHP_CODE" "--path=${WP_PATH}"
         fi
 
         FOUND=false
@@ -222,6 +251,6 @@ case "$GROUP" in
         ;;
 esac
 
-# ─────────────────────────── exec as www-data ────────────────────────────────
-# exec → no subshell; argv slice → no interpolation
-exec sudo -u "$EXEC_AS" "${ARGV[@]}"
+# ─────────────────────────── exec as the web user ────────────────────────────
+# exec → no subshell; argv slice → no interpolation; drop root → EXEC_AS.
+drop_and_exec "${ARGV[@]}"

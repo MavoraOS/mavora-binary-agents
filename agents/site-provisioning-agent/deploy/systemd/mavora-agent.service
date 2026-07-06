@@ -3,33 +3,41 @@
 #
 # Security model: the agent runs as root and execs its helpers (write-vhost,
 # wp-safe, firewall-apply) and system binaries (nginx -t, systemctl reload nginx)
-# DIRECTLY — there is no sudo. The privilege boundary is:
+# DIRECTLY. wp-safe then drops to the web user (nginx/www-data) to run WP-CLI. The
+# privilege boundary is capabilities + filesystem confinement:
 #
 #   ProtectSystem=strict  → whole FS read-only except ReadWritePaths
-#   ReadWritePaths        → webroot + nginx dirs + state dir
-#   CapabilityBoundingSet= → empty: all Linux capabilities dropped
-#   AmbientCapabilities=  → empty
-#   SystemCallFilter=@system-service → restrict to service-appropriate syscalls
+#   ReadWritePaths        → webroot + nginx dirs + state dir + log dir
+#   CapabilityBoundingSet → ONLY the caps the privileged ops actually need
+#                           (file ownership/mode + drop to the web user)
 #
-# Other hardening still in force:
-#   ProtectHome=yes       → no access to /home or /root
-#   PrivateTmp=yes        → isolated /tmp per service
-#   ProtectKernelTunables=yes → cannot write /proc/sys or sysctl
-#   ProtectKernelModules=yes  → cannot load kernel modules
-#   ProtectControlGroups=yes  → cannot modify cgroup hierarchy
-#   RestrictSUIDSGID=yes  → cannot set SUID/SGID bits
-#   LockPersonality=yes   → cannot change execution domain
-#   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX → minimal socket families
+# Capabilities granted (minimal set):
+#   CAP_DAC_OVERRIDE  → write nginx vhost files regardless of dir mode
+#   CAP_CHOWN/CAP_FOWNER → own/adjust files the helpers create
+#   CAP_SETUID/CAP_SETGID → wp-safe drops to the web user for WP-CLI
+#   CAP_KILL          → manage helper child processes / timeouts
 #
-# NOTE: deploy/sudoers/mavora-agent is now VESTIGIAL (no longer used by the
-# service). It is left in the repo for reference; install.sh still installs it
-# for backwards compatibility but the agent never invokes sudo.
+# WHY NoNewPrivileges=no + NO seccomp options:
+#   A seccomp syscall filter (@system-service) made the provision HANG SILENTLY at
+#   the FIRST privileged helper exec — the service could only provision when run
+#   manually as root without the sandbox. The agent legitimately forks bash +
+#   WP-CLI (PHP) + MySQL client + nginx; a restrictive syscall filter is too fragile
+#   for that workload. Every seccomp-based option (SystemCallFilter, RestrictSUIDSGID,
+#   RestrictAddressFamilies, LockPersonality, ProtectKernel*) also forces
+#   NoNewPrivileges=yes, which would (a) block the uid-0 exec rule from handing the
+#   bounding-set caps to the root helpers and (b) neuter the privilege drop. So they
+#   are all omitted and NoNewPrivileges is explicitly off. The security boundary is the
+#   minimal capability set + the mount-based filesystem confinement above.
+#
+# PRIVILEGE DROP — setpriv/runuser, NOT sudo:
+#   wp-safe drops to the web user via setpriv/runuser (setuid() syscall + CAP_SETUID),
+#   not the setuid `sudo` binary — robust regardless of NoNewPrivileges and with no
+#   sudoers dependency. The setuid drop clears caps, so WP-CLI/PHP runs with none.
+#   deploy/sudoers/mavora-agent is VESTIGIAL.
 #
 # MemoryDenyWriteExecute intentionally OMITTED:
-#   wp-safe helper runs PHP under www-data. Some PHP/OPcache-JIT configurations
-#   require W+X memory pages. MDWE would cause WP-CLI to crash silently on
-#   affected PHP versions. If the fleet PHP CLI has JIT disabled (opcache.jit=0),
-#   MDWE=yes can be re-added for stronger hardening. See agent/05 §37.4 for details.
+#   wp-safe runs PHP; some PHP/OPcache-JIT configs require W+X pages. MDWE would crash
+#   WP-CLI silently on affected versions. Re-add only if the fleet PHP CLI has JIT off.
 #
 # IMPORTANT: ReadWritePaths values are injected by install.sh at install time.
 #   The PLACEHOLDER_ tokens below are replaced during installation.
@@ -59,10 +67,25 @@ StartLimitInterval=60
 StartLimitBurst=5
 
 # ── Hardening ──────────────────────────────────────────────────────────────
-# Drop all Linux capabilities — root process with empty CapabilityBoundingSet
-# cannot acquire any capability beyond what it already holds at service start.
-CapabilityBoundingSet=
+# Minimal capability set — ONLY what the privileged helpers need: write/own nginx
+# vhost files (DAC_OVERRIDE/CHOWN/FOWNER), drop to the web user for WP-CLI
+# (SETUID/SETGID), and manage helper child processes (KILL). Everything else is
+# dropped, so a compromised agent cannot e.g. load modules, raw-net, or reboot.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_KILL
+# No ambient caps: the root agent + its root helpers receive the bounding-set caps
+# via the uid-0 exec rule, and the setpriv/runuser drop to the web user CLEARS all
+# caps — so the WP-CLI/PHP process runs as the web user with ZERO capabilities.
 AmbientCapabilities=
+
+# NoNewPrivileges MUST stay off. It is required for (a) the uid-0 exec rule to hand
+# the bounding-set caps to the root helpers, and (b) the privilege drop. Enabling it
+# (which any seccomp-based option below would force) caused the provision to HANG at
+# the first helper exec — the service could then only provision when run manually as
+# root. That is why SystemCallFilter / RestrictSUIDSGID / RestrictAddressFamilies /
+# LockPersonality / ProtectKernel* (all seccomp-based → force NoNewPrivileges=yes) are
+# intentionally NOT used here. The security boundary is capabilities + the mount-based
+# filesystem confinement below.
+NoNewPrivileges=no
 
 # Whole filesystem read-only except ReadWritePaths.
 ProtectSystem=strict
@@ -73,29 +96,10 @@ ProtectHome=yes
 # Private /tmp — isolated from other services.
 PrivateTmp=yes
 
-# Cannot write to /proc/sys (kernel tunables).
-ProtectKernelTunables=yes
-
-# Cannot load/unload kernel modules.
-ProtectKernelModules=yes
-
-# Cannot modify cgroup hierarchy.
+# Cannot modify cgroup hierarchy (mount-based; does not force NoNewPrivileges).
 ProtectControlGroups=yes
 
-# Cannot set SUID/SGID bits on files.
-RestrictSUIDSGID=yes
-
-# Cannot change execution domain (setdomainname, etc).
-LockPersonality=yes
-
-# Minimal address families: IPv4, IPv6, Unix sockets.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-
-# Restrict to syscalls typical for a daemon service.
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-
-# MemoryDenyWriteExecute intentionally absent — see header comment above.
+# MemoryDenyWriteExecute also absent — see header comment above.
 
 # ── ReadWritePaths ─────────────────────────────────────────────────────────
 # MUST include:
