@@ -6,7 +6,7 @@
 # DIRECTLY. wp-safe then drops to the web user (nginx/www-data) to run WP-CLI. The
 # privilege boundary is capabilities + filesystem confinement:
 #
-#   ProtectSystem=strict  → whole FS read-only except ReadWritePaths
+#   ProtectSystem=full    → /usr /boot /etc read-only (/var /run /tmp writable)
 #   ReadWritePaths        → webroot + nginx dirs + state dir + log dir
 #   CapabilityBoundingSet → ONLY the caps the privileged ops actually need
 #                           (file ownership/mode + drop to the web user)
@@ -87,8 +87,12 @@ AmbientCapabilities=
 # filesystem confinement below.
 NoNewPrivileges=no
 
-# Whole filesystem read-only except ReadWritePaths.
-ProtectSystem=strict
+# /usr, /boot, /etc mounted read-only; /var, /run, /tmp stay writable. Required so
+# `nginx -t` can open its error log (/var/log/nginx/error.log) + pid (/run/nginx.pid)
+# and WP-CLI can write the webroot/cache. ProtectSystem=strict made /var + /run
+# read-only too, which broke `nginx -t` with "Read-only file system". /etc/nginx is
+# re-opened for the write-vhost helper via ReadWritePaths below.
+ProtectSystem=full
 
 # No access to /home, /root, or /run/user.
 ProtectHome=yes
