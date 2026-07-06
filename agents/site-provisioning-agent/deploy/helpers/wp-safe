@@ -127,11 +127,16 @@ case "$GROUP" in
             MAP_DOMAIN="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; shift
             MAP_TITLE="${1:-$MAP_DOMAIN}"
             [[ $# -ge 1 ]] && shift || true
-            # Strict DNS-hostname regex — no shell/PHP metacharacter can pass (the value
-            # is interpolated into a double-quoted PHP string below).
+            # Hard charset guard FIRST (libc-independent). A `case` glob matches the whole
+            # string char-by-char and is NOT line-oriented, so an embedded newline or
+            # control char is caught here. This does NOT rely on `[[ =~ ^…$ ]]`, whose `$`
+            # can match *before* an embedded newline under glibc regexec — a newline-
+            # injection bypass that would let "<valid>\n\";system(...);//" reach `wp eval`.
+            case "$MAP_DOMAIN" in *[!a-z0-9.-]*) fail "Invalid domain (charset) for create-mapped: $MAP_DOMAIN" ;; esac
+            case "$MAP_TITLE"  in *[!A-Za-z0-9._\ -]*) fail "Invalid title (charset) for create-mapped: $MAP_TITLE" ;; esac
+            # Structural validation: dot-separated labels, no leading/trailing hyphen.
             DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
             [[ "$MAP_DOMAIN" =~ $DOMAIN_RE ]] || fail "Invalid domain for create-mapped: $MAP_DOMAIN"
-            # Title: printable safe subset only (letters/digits/space/dot/underscore/hyphen).
             TITLE_RE='^[A-Za-z0-9._ -]+$'
             [[ "$MAP_TITLE" =~ $TITLE_RE ]] || fail "Invalid title for create-mapped: $MAP_TITLE"
             # FIXED PHP template — only the validated $MAP_DOMAIN / $MAP_TITLE are substituted.
