@@ -16,6 +16,7 @@
 #   CAP_CHOWN/CAP_FOWNER → own/adjust files the helpers create
 #   CAP_SETUID/CAP_SETGID → wp-safe drops to the web user for WP-CLI
 #   CAP_KILL          → manage helper child processes / timeouts
+#   CAP_NET_BIND_SERVICE → `nginx -t` test-binds :80 while validating the vhost
 #
 # WHY NoNewPrivileges=no + NO seccomp options:
 #   A seccomp syscall filter (@system-service) made the provision HANG SILENTLY at
@@ -71,7 +72,8 @@ StartLimitBurst=5
 # vhost files (DAC_OVERRIDE/CHOWN/FOWNER), drop to the web user for WP-CLI
 # (SETUID/SETGID), and manage helper child processes (KILL). Everything else is
 # dropped, so a compromised agent cannot e.g. load modules, raw-net, or reboot.
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_KILL
+# CAP_NET_BIND_SERVICE: `nginx -t` test-binds :80 while validating the vhost.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID CAP_KILL CAP_NET_BIND_SERVICE
 # No ambient caps: the root agent + its root helpers receive the bounding-set caps
 # via the uid-0 exec rule, and the setpriv/runuser drop to the web user CLEARS all
 # caps — so the WP-CLI/PHP process runs as the web user with ZERO capabilities.
