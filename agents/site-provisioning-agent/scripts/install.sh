@@ -187,9 +187,16 @@ create_user() {
 # (Debian convention). Ubuntu's nginx.conf already includes sites-enabled;
 # RHEL/AlmaLinux ships conf.d-only, so create the dirs and add the include via a
 # conf.d drop-in (no edit to nginx.conf). Idempotent.
+#
+# Flat layout: pass --nginx-available /etc/nginx/conf.d --nginx-enabled /etc/nginx/conf.d
+# to write vhosts straight into conf.d (RHEL-native). In that case NO include drop-in is
+# added — nginx.conf already includes /etc/nginx/conf.d/*.conf, and adding another would
+# create a self-referential include cycle that fails `nginx -t`.
 setup_nginx_layout() {
     mkdir -p "$NGINX_AVAILABLE" "$NGINX_ENABLED"
-    if [[ "$OS_FAMILY" == "rhel" ]] && command -v nginx &>/dev/null; then
+    local enabled_norm="${NGINX_ENABLED%/}"
+    if [[ "$OS_FAMILY" == "rhel" ]] && command -v nginx &>/dev/null \
+        && [[ "$enabled_norm" != "/etc/nginx/conf.d" ]]; then
         local dropin=/etc/nginx/conf.d/mavora-sites-enabled.conf
         if [[ ! -f "$dropin" ]]; then
             printf 'include %s/*.conf;\n' "$NGINX_ENABLED" > "$dropin"
