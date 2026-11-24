@@ -17,8 +17,8 @@
 # Usage (called directly by the root agent):
 #   sudo wp-safe site list [--url=<url>] [--format=json]
 #   sudo wp-safe site create-mapped <domain> [<title>]   # wpmu_create_blog(domain,'/',...)
-#   sudo wp-safe site archive --slug=<slug>
-#   sudo wp-safe site delete --slug=<slug> [--yes]
+#   sudo wp-safe site deactivate <blog_id> [--url=<url>]
+#   sudo wp-safe site delete <blog_id> [--yes] [--url=<url>]
 #   sudo wp-safe user create <login> <email> --role=<role>
 #   sudo wp-safe user get <login> --format=json
 #   sudo wp-safe user delete <login> [--yes] [--reassign=<id>]
@@ -92,14 +92,16 @@ ALLOWED_GROUPS=("site" "user" "db" "option")
 # create-mapped is handled by a dedicated branch below (it is NOT a real WP-CLI
 # subcommand — it runs wpmu_create_blog via `wp eval`), so it is intentionally
 # absent from this generic list.
-ALLOWED_SITE_CMDS=("list" "archive" "delete")
+ALLOWED_SITE_CMDS=("list" "deactivate" "delete")
 ALLOWED_USER_CMDS=("create" "get" "delete" "application-password")
 ALLOWED_USER_APPPW_CMDS=("create" "delete")
 ALLOWED_DB_CMDS=("check")
 ALLOWED_OPTION_CMDS=("get" "update")
-# HARD CONSTRAINT: the option group may only touch this single option key.
+# HARD CONSTRAINT: the option group may only touch these exact option keys.
 # Any other key is rejected — a compromised agent cannot read/write arbitrary WP options.
-ALLOWED_OPTION_KEY="mavora_provisioning_id"
+#   mavora_provisioning_id → ownership marker (SP-SG-01)
+#   admin_email / WPLANG   → wp_options applied at provision time (§10.2)
+ALLOWED_OPTION_KEYS=("mavora_provisioning_id" "admin_email" "WPLANG")
 
 # ─────────────────────────── arg validation ──────────────────────────────────
 validate_arg() {
@@ -239,8 +241,11 @@ case "$GROUP" in
         # First remaining arg must be the option key — enforce it.
         [[ $# -ge 1 ]] || fail "wp option $SUBCMD requires an option key argument"
         OPTION_KEY="$1"; shift
-        [[ "$OPTION_KEY" == "$ALLOWED_OPTION_KEY" ]] || \
-            fail "wp option key not allowed: '$OPTION_KEY' (only '$ALLOWED_OPTION_KEY' is permitted)"
+        KEY_OK=false
+        for k in "${ALLOWED_OPTION_KEYS[@]}"; do
+            [[ "$OPTION_KEY" == "$k" ]] && KEY_OK=true && break
+        done
+        $KEY_OK || fail "wp option key not allowed: '$OPTION_KEY' (allowed: ${ALLOWED_OPTION_KEYS[*]})"
         ARGV+=("$OPTION_KEY")
 
         # Remaining args (e.g. the value for 'update', --url=, --format=) are validated.

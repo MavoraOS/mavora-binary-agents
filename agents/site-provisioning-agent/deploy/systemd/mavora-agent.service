@@ -30,11 +30,10 @@
 #   are all omitted and NoNewPrivileges is explicitly off. The security boundary is the
 #   minimal capability set + the mount-based filesystem confinement above.
 #
-# PRIVILEGE DROP — setpriv/runuser, NOT sudo:
+# PRIVILEGE DROP — setpriv/runuser, NOT sudo (RA-5: no sudoers shipped):
 #   wp-safe drops to the web user via setpriv/runuser (setuid() syscall + CAP_SETUID),
 #   not the setuid `sudo` binary — robust regardless of NoNewPrivileges and with no
 #   sudoers dependency. The setuid drop clears caps, so WP-CLI/PHP runs with none.
-#   deploy/sudoers/mavora-agent is VESTIGIAL.
 #
 # MemoryDenyWriteExecute intentionally OMITTED:
 #   wp-safe runs PHP; some PHP/OPcache-JIT configs require W+X pages. MDWE would crash

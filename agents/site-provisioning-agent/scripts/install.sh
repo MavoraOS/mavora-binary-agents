@@ -31,7 +31,7 @@
 # Security invariants:
 #   - mTLS keypair generated ON this VPS; private key NEVER transmitted
 #   - cert ↔ key verified before service start
-#   - sudoers installed ONLY after visudo -c validation
+#   - NO sudoers shipped (RA-5): agent runs root-in-sandbox; wp-safe drops via setpriv
 #   - install_token never logged (kept in variable, file deleted after exchange)
 #   - secret files stored 0600 owner mavora-agent
 #   - idempotent: re-run does not destroy existing valid installation
@@ -53,7 +53,8 @@ CONF_DIR="/etc/mavora-agent"
 STATE_DIR="/var/lib/mavora-agent"
 LOG_DIR="/var/log/mavora-agent"
 SYSTEMD_UNIT="/etc/systemd/system/mavora-agent.service"
-SUDOERS_DEST="/etc/sudoers.d/mavora-agent"
+# Legacy sudoers path — no longer installed (RA-5); removed if left by old installs.
+SUDOERS_LEGACY="/etc/sudoers.d/mavora-agent"
 WEBROOT="/var/www"
 NGINX_AVAILABLE="/etc/nginx/sites-available"
 NGINX_ENABLED="/etc/nginx/sites-enabled"
@@ -276,6 +277,57 @@ generate_agent_id() {
     openssl rand -hex 16 | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/'
 }
 
+# Embedded verbatim from scripts/lib/bootstrap-response.sh (a `curl | bash` install has no file beside this one);
+# tests/bootstrap_scripts_test.go fails if this copy differs from the source.
+# BEGIN bootstrap-response
+# bootstrap_field <response-file> <member>: prints one member of the (unwrapped) answer, empty when absent or not a string. Never logs it.
+bootstrap_field() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+inner = d.get('data')
+if isinstance(inner, dict):
+    d = inner
+v = d.get(sys.argv[2], '')
+sys.stdout.write(v if isinstance(v, str) else '')
+PY
+}
+
+# bootstrap_ed25519_pem <base64url>: prints the PKIX PEM of a raw 32-byte Ed25519 public key; non-zero (and a message) when it is not 32 bytes.
+bootstrap_ed25519_pem() {
+    printf '%s' "$1" | python3 -c '
+import base64, binascii, sys, textwrap
+b64 = sys.stdin.read().strip()
+try:
+    raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+except (binascii.Error, ValueError):
+    sys.stderr.write("ed25519 pubkey is not base64url\n"); sys.exit(1)
+if len(raw) != 32:
+    sys.stderr.write("ed25519 pubkey is %d bytes, want 32\n" % len(raw)); sys.exit(1)
+der = bytes.fromhex("302a300506032b6570032100") + raw
+print("-----BEGIN PUBLIC KEY-----")
+print("\n".join(textwrap.wrap(base64.b64encode(der).decode(), 64)))
+print("-----END PUBLIC KEY-----")
+'
+}
+
+# parse_bootstrap_response <response-file>: sets BR_SIGNED_CERT BR_CA BR_CONNECTION_KEY BR_ED25519_PEM BR_SIGNING_KEY_ID.
+# Non-zero (message on stderr) when signed_cert, connection_key or ed25519_pubkey is missing or the key is not a 32-byte Ed25519 key.
+# `ca` is returned as it is (empty when the answer has none): install.sh requires it, rotate.sh keeps the CA it already trusts.
+parse_bootstrap_response() {
+    local file="$1" pub
+    BR_SIGNED_CERT="$(bootstrap_field "$file" signed_cert)"
+    BR_CA="$(bootstrap_field "$file" ca)"
+    BR_CONNECTION_KEY="$(bootstrap_field "$file" connection_key)"
+    BR_SIGNING_KEY_ID="$(bootstrap_field "$file" signing_key_id)"
+    pub="$(bootstrap_field "$file" ed25519_pubkey)"
+    [[ -n "$BR_SIGNED_CERT" ]] || { echo "bootstrap response missing signed_cert" >&2; return 1; }
+    [[ -n "$BR_CONNECTION_KEY" ]] || { echo "bootstrap response missing connection_key" >&2; return 1; }
+    [[ -n "$pub" ]] || { echo "bootstrap response missing ed25519_pubkey" >&2; return 1; }
+    BR_ED25519_PEM="$(bootstrap_ed25519_pem "$pub")" || return 1
+}
+# END bootstrap-response
+
 # ─────────────────────────── step 7: bootstrap exchange ──────────────────────
 # POST {install_token, csr} → {signed_cert, ca, connection_key(once), ed25519_pubkey, signing_key_id}
 # NEVER logs the install_token or any returned secrets.
@@ -337,36 +389,17 @@ bootstrap_exchange() {
 
     # Parse response fields — never log raw values. The BE wraps the bootstrap payload
     # in the ADR-030 {"data":{...}} envelope, so unwrap "data" (fall back to top-level).
-    local signed_cert ca_cert connection_key ed25519_pubkey signing_key_id
-    signed_cert="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('signed_cert',''))")"
-    ca_cert="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('ca',''))")"
-    connection_key="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('connection_key',''))")"
-    ed25519_pubkey="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('ed25519_pubkey',''))")"
-    signing_key_id="$(python3 -c "import json,sys; d=json.load(open('$response_file')); d=d.get('data',d); print(d.get('signing_key_id',''))")"
-
-    [[ -n "$signed_cert" ]] || fail "Bootstrap response missing signed_cert."
-    [[ -n "$ca_cert" ]] || fail "Bootstrap response missing ca (CA certificate)."
-    [[ -n "$connection_key" ]] || fail "Bootstrap response missing connection_key."
-    [[ -n "$ed25519_pubkey" ]] || fail "Bootstrap response missing ed25519_pubkey."
+    # Shared with rotate.sh (embedded block, see scripts/lib/bootstrap-response.sh): unwraps {"data":...}, converts the raw base64url
+    # ed25519_pubkey to the PEM PKIX file the agent loads (auth.loadOnePEMKey), refusing anything but 32 bytes.
+    parse_bootstrap_response "$response_file" || fail "Bootstrap response unusable (see message above)."
+    [[ -n "$BR_CA" ]] || fail "Bootstrap response missing ca (CA certificate)."
+    local signed_cert="$BR_SIGNED_CERT" ca_cert="$BR_CA" connection_key="$BR_CONNECTION_KEY" signing_key_id="$BR_SIGNING_KEY_ID"
 
     # Store credentials — all 0600 owner mavora-agent (never log values)
     printf '%s\n' "$signed_cert" > "$TLS_CERT"
     printf '%s\n' "$ca_cert"     > "$CA_CERT"
     printf '%s\n' "$connection_key" > "$BEARER_FILE"
-    # ed25519_pubkey arrives as base64url(no padding) raw 32-byte key, but the agent
-    # loads it as a PEM PKIX file (auth.loadOnePEMKey → pem.Decode → ParsePKIXPublicKey).
-    # Wrap the raw key in the standard Ed25519 SubjectPublicKeyInfo header + PEM.
-    printf '%s' "$ed25519_pubkey" | python3 -c '
-import base64, sys, textwrap
-b64 = sys.stdin.read().strip()
-raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
-if len(raw) != 32:
-    sys.stderr.write("ed25519 pubkey is %d bytes, want 32\n" % len(raw)); sys.exit(1)
-der = bytes.fromhex("302a300506032b6570032100") + raw
-print("-----BEGIN PUBLIC KEY-----")
-print("\n".join(textwrap.wrap(base64.b64encode(der).decode(), 64)))
-print("-----END PUBLIC KEY-----")
-' > "$ED25519_PUB" || fail "Failed to convert ed25519 pubkey to PEM PKIX"
+    printf '%s\n' "$BR_ED25519_PEM" > "$ED25519_PUB"
 
     # Promote temp key to final location
     mv "$key_tmp" "$TLS_KEY"
@@ -467,26 +500,17 @@ install_systemd() {
     info "Systemd unit installed: $SYSTEMD_UNIT"
 }
 
-# ─────────────────────────── step 11: install sudoers (visudo-gated) ────────
-# CRITICAL: ONLY install if visudo -c passes. Broken sudoers → refuse install.
-install_sudoers() {
-    local sudoers_src
-    sudoers_src="$(dirname "$(realpath "$0")")/../deploy/sudoers/mavora-agent"
-    if [[ ! -f "$sudoers_src" ]]; then
-        sudoers_src="$(dirname "$(realpath "$0")")/sudoers.d-mavora-agent"
-    fi
-    [[ -f "$sudoers_src" ]] || fail "Cannot find sudoers file (expected at deploy/sudoers/mavora-agent)"
-
-    # Install helpers first (sudoers references them by path)
+# ─────────────────────────── step 11: install helpers (no sudoers — RA-5) ──
+# The agent runs as root in the systemd sandbox and execs its helpers directly;
+# wp-safe drops to the web user via setpriv. Sudoers is no longer shipped —
+# a file left behind by an older install is removed (idempotent).
+install_privileged_layer() {
     install_helpers
 
-    # Validate before installing (refuse on any syntax error)
-    if ! visudo -c -f "$sudoers_src" &>/dev/null; then
-        fail "visudo -c FAILED for $sudoers_src — refusing to install sudoers. This is a bug; please report."
+    if [[ -f "$SUDOERS_LEGACY" ]]; then
+        rm -f "$SUDOERS_LEGACY"
+        info "Legacy sudoers removed (RA-5 — no sudoers dependency): $SUDOERS_LEGACY"
     fi
-
-    install -m 0440 -o root -g root "$sudoers_src" "$SUDOERS_DEST"
-    info "Sudoers installed after visudo -c PASS: $SUDOERS_DEST"
 }
 
 # Install helper scripts (root-owned 0755, validate argv)
@@ -602,7 +626,7 @@ main() {
 
     write_config
     install_systemd
-    install_sudoers
+    install_privileged_layer
     enable_start_service
     verify_active
     print_next_steps

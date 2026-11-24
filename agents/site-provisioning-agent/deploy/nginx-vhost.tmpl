@@ -1,0 +1,55 @@
+# Mavora Site Provisioning Agent — nginx HTTP origin vhost template (SP-T-405)
+#
+# Model C invariants (HARD — any violation is a critical bug):
+#   - HTTP port 80 ONLY. NO ssl_* directives. NO listen 443. NO AOP.
+#   - NO HTTPS redirect. SSL is Customer-managed at the edge.
+#   - Baseline per-server_name rate limiting: limit_req 5r/s burst 20 + limit_conn 20 (RC-5).
+#
+# Usage:
+#   This file is a reference deploy template for manual VPS baseline review.
+#   The agent binary renders the vhost at runtime via the compiled-in template
+#   (internal/nginx/nginx.go) using the write-vhost helper.
+#   This standalone file exists for:
+#     (a) operator review before agent install,
+#     (b) manual baseline comparison after a compromise/rebuild,
+#     (c) documentation of the expected vhost shape.
+#
+# Variables (replaced at render time by the agent):
+#   DOMAIN     — the provisioned domain (e.g. example.com)
+#   WEBROOT    — WordPress Multisite root (e.g. /var/www, config: webroot)
+#   PHP_SOCKET — php-fpm socket path (e.g. /run/php/php8.2-fpm.sock)
+#
+# NEVER add ssl_*, listen 443, or proxy_pass to Cloudflare/AOP here.
+
+limit_req_zone $binary_remote_addr zone=DOMAIN_req:10m rate=5r/s;
+limit_conn_zone $binary_remote_addr zone=DOMAIN_conn:10m;
+
+server {
+    listen 80;
+    listen [::]:80;
+
+    server_name DOMAIN;
+
+    root WEBROOT;
+    index index.php index.html;
+
+    # Baseline rate limiting per server_name (RC-5 / SP-T-405)
+    limit_req zone=DOMAIN_req burst=20 nodelay;
+    limit_conn DOMAIN_conn 20;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass PHP_SOCKET;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_intercept_errors on;
+    }
+
+    # Block access to dotfiles (.git, .htaccess, .env)
+    location ~ /\. {
+        deny all;
+    }
+}

@@ -89,6 +89,57 @@ generate_new_keypair() {
     NEW_KEY_PATH="$key_new"
 }
 
+# Embedded verbatim from scripts/lib/bootstrap-response.sh (same block as install.sh: both read the same bootstrap answer);
+# tests/bootstrap_scripts_test.go fails if this copy differs from the source.
+# BEGIN bootstrap-response
+# bootstrap_field <response-file> <member>: prints one member of the (unwrapped) answer, empty when absent or not a string. Never logs it.
+bootstrap_field() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+inner = d.get('data')
+if isinstance(inner, dict):
+    d = inner
+v = d.get(sys.argv[2], '')
+sys.stdout.write(v if isinstance(v, str) else '')
+PY
+}
+
+# bootstrap_ed25519_pem <base64url>: prints the PKIX PEM of a raw 32-byte Ed25519 public key; non-zero (and a message) when it is not 32 bytes.
+bootstrap_ed25519_pem() {
+    printf '%s' "$1" | python3 -c '
+import base64, binascii, sys, textwrap
+b64 = sys.stdin.read().strip()
+try:
+    raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+except (binascii.Error, ValueError):
+    sys.stderr.write("ed25519 pubkey is not base64url\n"); sys.exit(1)
+if len(raw) != 32:
+    sys.stderr.write("ed25519 pubkey is %d bytes, want 32\n" % len(raw)); sys.exit(1)
+der = bytes.fromhex("302a300506032b6570032100") + raw
+print("-----BEGIN PUBLIC KEY-----")
+print("\n".join(textwrap.wrap(base64.b64encode(der).decode(), 64)))
+print("-----END PUBLIC KEY-----")
+'
+}
+
+# parse_bootstrap_response <response-file>: sets BR_SIGNED_CERT BR_CA BR_CONNECTION_KEY BR_ED25519_PEM BR_SIGNING_KEY_ID.
+# Non-zero (message on stderr) when signed_cert, connection_key or ed25519_pubkey is missing or the key is not a 32-byte Ed25519 key.
+# `ca` is returned as it is (empty when the answer has none): install.sh requires it, rotate.sh keeps the CA it already trusts.
+parse_bootstrap_response() {
+    local file="$1" pub
+    BR_SIGNED_CERT="$(bootstrap_field "$file" signed_cert)"
+    BR_CA="$(bootstrap_field "$file" ca)"
+    BR_CONNECTION_KEY="$(bootstrap_field "$file" connection_key)"
+    BR_SIGNING_KEY_ID="$(bootstrap_field "$file" signing_key_id)"
+    pub="$(bootstrap_field "$file" ed25519_pubkey)"
+    [[ -n "$BR_SIGNED_CERT" ]] || { echo "bootstrap response missing signed_cert" >&2; return 1; }
+    [[ -n "$BR_CONNECTION_KEY" ]] || { echo "bootstrap response missing connection_key" >&2; return 1; }
+    [[ -n "$pub" ]] || { echo "bootstrap response missing ed25519_pubkey" >&2; return 1; }
+    BR_ED25519_PEM="$(bootstrap_ed25519_pem "$pub")" || return 1
+}
+# END bootstrap-response
+
 exchange_rotate() {
     local csr_file="$1"
     local csr_pem response_file http_code
@@ -104,8 +155,12 @@ exchange_rotate() {
         "$(printf '%s' "$INSTALL_TOKEN" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))')" \
         "$(printf '%s' "$csr_pem" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")"
 
+    # The gateway's certificate is signed by the agent CA saved at install time; the agent trusts that CA and nothing else.
+    [[ -s "$CA_CERT" ]] || fail "Agent CA ${CA_CERT} not found: cannot verify the control-plane gateway. Re-run install.sh."
+
     http_code="$(curl \
         --fail --silent --show-error --max-time 30 \
+        --cacert "$CA_CERT" \
         --write-out "%{http_code}" \
         --output "$response_file" \
         -X POST \
@@ -117,13 +172,12 @@ exchange_rotate() {
     [[ "$http_code" == "200" || "$http_code" == "201" ]] || \
         fail "Rotate returned HTTP $http_code."
 
-    NEW_CERT="$(python3 -c "import json; d=json.load(open('$response_file')); print(d['signed_cert'])")"
-    NEW_BEARER="$(python3 -c "import json; d=json.load(open('$response_file')); print(d['connection_key'])")"
-    NEW_ED25519="$(python3 -c "import json; d=json.load(open('$response_file')); print(d['ed25519_pubkey'])")"
-    NEW_SIGNING_KEY_ID="$(python3 -c "import json; d=json.load(open('$response_file')); print(d.get('signing_key_id',''))")"
-
-    [[ -n "$NEW_CERT" && -n "$NEW_BEARER" && -n "$NEW_ED25519" ]] || \
-        fail "Rotate response missing required fields."
+    # Same reader as install.sh: unwraps {"data":...}; NEW_ED25519 is the PEM PKIX the agent loads, not the raw base64url.
+    parse_bootstrap_response "$response_file" || fail "Rotate response unusable (see message above). Old credentials are unchanged."
+    NEW_CERT="$BR_SIGNED_CERT"
+    NEW_BEARER="$BR_CONNECTION_KEY"
+    NEW_ED25519="$BR_ED25519_PEM"
+    NEW_SIGNING_KEY_ID="$BR_SIGNING_KEY_ID"
 
     rm -f "$csr_file"
     unset INSTALL_TOKEN
